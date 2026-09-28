@@ -1,6 +1,6 @@
 {
   "name": "zapchat",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Terminal-native LAN chat. No accounts, no cloud, no servers — just your local network.",
   "keywords": [
     "lan",
@@ -28,7 +28,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",

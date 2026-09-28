@@ -4,7 +4,7 @@
  * It is duplicated here (rather than read from disk at runtime) so the version
  * is available in any build/bundle without filesystem access.
  */
-export const VERSION = '2.0.0';
+export const VERSION = '3.0.0';
 
 /** Short product name used in the UI and in beacons' user agent strings. */
 export const APP_NAME = 'zapchat';
