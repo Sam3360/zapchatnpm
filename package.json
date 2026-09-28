@@ -1,0 +1,67 @@
+{
+  "name": "zapchat",
+  "version": "1.0.0",
+  "description": "Terminal-native LAN chat. No accounts, no cloud, no servers — just your local network.",
+  "keywords": [
+    "lan",
+    "chat",
+    "cli",
+    "tui",
+    "terminal",
+    "p2p",
+    "udp",
+    "discovery",
+    "local-network"
+  ],
+  "license": "MIT",
+  "author": "Samarth Chugh (Sam3360)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "zapchat": "./dist/cli/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sam3360/zapchatnpm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sam3360/zapchatnpm/issues"
+  },
+  "homepage": "https://github.com/Sam3360/zapchatnpm",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "start": "node dist/cli/main.js",
+    "dev": "node --watch-path=src dist/cli/main.js",
+    "test": "npm run build && npm run build:test && node --test --test-concurrency=1 \"dist-test/test/**/*.test.js\"",
+    "test:unit": "npm run build:test && node --test \"dist-test/test/unit/**/*.test.js\"",
+    "test:integration": "npm run build && npm run build:test && node --test --test-concurrency=1 \"dist-test/test/integration/**/*.test.js\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.3.0",
+    "string-width": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.3.0",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,20 @@
+node_modules/
+dist/
+dist-test/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+
+# packaging leftovers
+*.tgz
+.tmp-install/
+
+# stale test config dirs from older test iterations
+.tmp-test-config/
