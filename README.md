@@ -81,8 +81,13 @@ Terminal. No shell-specific paths or `/bin/bash` assumptions.
 
 ### Interoperability (npm ↔ Python)
 
-Both implementations announce themselves with the same UDP beacons, so Python
-and npm users **see each other** on the LAN. Chat compatibility is per-link:
+> **Status since npm v2:** cross-stack discovery is currently broken. npm's
+> discovery parser only accepts its own `v: 2` beacons and stamps its own
+> beacons `v: 2`, while the Python client speaks `v: 1` — so the two do not
+> see each other's announcements. v5 restores beacon interop (dual-version
+> beacons) and adds opt-in plaintext links; see the table for what works.
+
+Chat compatibility is per-link:
 
 | Link | Works today? | Why |
 | --- | --- | --- |

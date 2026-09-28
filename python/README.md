@@ -9,11 +9,11 @@ and an npm user on the same Wi-Fi can chat with each other.
 
 > The Python client runs the proven protocol v1 wire format (JSON envelopes
 > over TCP, discovery beacons). The Node.js client's protocol v2 adds
-> TLS-style encryption on top of the same envelope shapes — so Python and npm
-> users **see each other** on the LAN via the shared discovery, and both sides
-> use identical message formats, but npm v2 currently refuses v1 chat links
-> (no plaintext fallback by design). npm ↔ npm and Python ↔ Python chat work
-> today; npm ↔ Python chat is on the roadmap.
+> TLS-style encryption on top of the same envelope shapes. Note: since npm v2,
+> the two stacks do **not** currently see each other's discovery beacons (the
+> npm parser only accepts its own `v: 2` beacons) and npm refuses v1 chat
+> links. npm ↔ npm and Python ↔ Python chat work today; beacon interop and an
+> opt-in plaintext bridge are coming in v5.
 
 ## Install
 
