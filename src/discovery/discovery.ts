@@ -19,9 +19,12 @@ import {
   ANNOUNCE_INTERVAL_MS,
   DEFAULT_DISCOVERY_PORT,
   DEFAULT_MULTICAST_ADDRESS,
+  DEFAULT_WIRE_VERSION,
   MAX_UDP_PACKET_BYTES,
+  SUPPORTED_WIRE_VERSIONS,
 } from '../protocol/constants.js';
 import {
+  SUPPORTED_WIRE_VERSION_SET,
   createEnvelope,
   parseAnnounceData,
   parseEnvelope,
@@ -49,6 +52,8 @@ export interface AnnounceObservation {
 /** A peer as announced on the LAN, including the rooms it is advertising. */
 export interface AnnouncedPeer extends PeerContact {
   rooms: string[];
+  /** Wire version from the peer's beacon (1 = legacy/Python, 2 = v2-capable). */
+  wireVersion: number;
 }
 
 export interface DiscoveryOptions {
@@ -264,37 +269,50 @@ export class DiscoveryService {
     }
 
     const snapshot = this.#options.getAnnounce();
-    const packet = buildBeacon(
-      // The room travels in the envelope, so receivers learn where to find us
-      // from the beacon itself rather than waiting for a TCP handshake.
-      { clientId: this.#clientId, username: snapshot.username, room: snapshot.room },
-      {
-        port: snapshot.port,
-        addresses: localAddresses(this.#interfaces()),
-        rooms: [snapshot.room, ...snapshot.rooms].filter(
-          (room): room is string => typeof room === 'string',
-        ),
-      },
-      this.#now(),
-    );
+    const announceData = {
+      port: snapshot.port,
+      addresses: localAddresses(this.#interfaces()),
+      rooms: [snapshot.room, ...snapshot.rooms].filter(
+        (room): room is string => typeof room === 'string',
+      ),
+    };
 
-    if (packet === null) {
-      this.#state = { ...this.#state, dropped: this.#state.dropped + 1 };
-      return;
+    // One beacon per supported wire version. v1 peers (the Python client) can
+    // only parse v:1 envelopes and v2-only peers (npm 2.x-4.x) only v:2, so a
+    // single-version beacon hides us from the other stack entirely. The
+    // packets are byte-identical except for the `v` field.
+    const packets: Buffer[] = [];
+    for (const version of SUPPORTED_WIRE_VERSIONS) {
+      const packet = buildBeacon(
+        // The room travels in the envelope, so receivers learn where to find us
+        // from the beacon itself rather than waiting for a TCP handshake.
+        { clientId: this.#clientId, username: snapshot.username, room: snapshot.room },
+        announceData,
+        this.#now(),
+        version,
+      );
+
+      if (packet !== null) {
+        packets.push(packet);
+      } else {
+        this.#state = { ...this.#state, dropped: this.#state.dropped + 1 };
+      }
     }
 
     for (const target of this.#targets()) {
-      socket.send(packet, 0, packet.length, this.#port, target, error => {
-        if (error !== null) {
-          this.#state = {
-            ...this.#state,
-            sendFailures: this.#state.sendFailures + 1,
-          };
-          return;
-        }
+      for (const packet of packets) {
+        socket.send(packet, 0, packet.length, this.#port, target, error => {
+          if (error !== null) {
+            this.#state = {
+              ...this.#state,
+              sendFailures: this.#state.sendFailures + 1,
+            };
+            return;
+          }
 
-        this.#state = { ...this.#state, beaconsSent: this.#state.beaconsSent + 1 };
-      });
+          this.#state = { ...this.#state, beaconsSent: this.#state.beaconsSent + 1 };
+        });
+      }
     }
   }
 
@@ -324,7 +342,10 @@ export class DiscoveryService {
       return;
     }
 
-    const envelope = parseEnvelope(raw, { now: this.#now() });
+    const envelope = parseEnvelope(raw, {
+      now: this.#now(),
+      allowedVersions: SUPPORTED_WIRE_VERSION_SET,
+    });
     if (envelope === null || envelope.type !== 'ANNOUNCE') {
       this.#state = { ...this.#state, dropped: this.#state.dropped + 1 };
       return;
@@ -370,6 +391,7 @@ export class DiscoveryService {
         // Trust the address we actually received from first.
         addresses: dedupe([remote.address, ...data.addresses]),
         rooms: data.rooms,
+        wireVersion: envelope.v,
       },
       {
         address: remote.address,
@@ -413,6 +435,7 @@ export function buildBeacon(
   sender: { clientId: string; username: string; room?: string | null },
   data: AnnounceData,
   now: number = Date.now(),
+  version: number = DEFAULT_WIRE_VERSION,
 ): Buffer | null {
   const trim = (candidate: AnnounceData): Buffer =>
     Buffer.from(
@@ -421,6 +444,7 @@ export function buildBeacon(
           ts: now,
           room: sender.room ?? null,
           data: candidate,
+          version,
         }),
       ),
       'utf8',

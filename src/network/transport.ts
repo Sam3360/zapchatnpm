@@ -26,13 +26,20 @@ import net from 'node:net';
 import {
   DEFAULT_TCP_PORT_BASE,
   HELLO_TIMEOUT_MS,
+  LEGACY_WIRE_VERSION,
+  MAGIC_BYTE,
   MAX_PEERS,
   MAX_PENDING_WRITE_BYTES,
   PEER_SILENCE_MS,
   PING_INTERVAL_MS,
+  PROTOCOL_VERSION,
   TCP_PORT_ATTEMPTS,
 } from '../protocol/constants.js';
 import { encodeFrame, FrameDecoder } from '../protocol/framing.js';
+import {
+  SUPPORTED_WIRE_VERSION_SET,
+  rewriteEnvelopeForWire,
+} from '../protocol/messages.js';
 import {
   createKeyExchange,
   encodeKeyExchangeForWire,
@@ -82,10 +89,10 @@ export interface PeerHandle {
   remotePort: number;
   connectedAt: number;
   latencyMs: number | null;
-  /** Fingerprint of the peer's long-term identity key (TOFU). */
+  /** Fingerprint of the peer's long-term identity key (TOFU); '' on plaintext links. */
   identityKeyId: string;
-  /** Always true in protocol v2: every link is encrypted. */
-  encrypted: true;
+  /** False only on opt-in plaintext v1 links (`--allow-plaintext`). */
+  encrypted: boolean;
 }
 
 export interface TransportHandlers {
@@ -111,6 +118,12 @@ export interface TransportOptions {
   identitySeed: Uint8Array;
   /** TOFU pin check; return 'mismatch' to refuse the peer. */
   checkPeerPin?: (clientId: string, identityKeyId: string) => PeerPinVerdict;
+  /**
+   * Opt-in (v5): accept and open unencrypted protocol v1 links, for talking
+   * to legacy peers such as the Python client. Off by default; when off, a
+   * plaintext stream is refused exactly like any other protocol violation.
+   */
+  allowPlaintext?: boolean;
   maxPeers?: number;
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
@@ -134,14 +147,25 @@ type HandshakeState =
       readonly mine: { privateKey: Buffer; exchange: HelloKeyExchange };
       readonly session: SecureSession;
     }
-  | { readonly phase: 'established'; readonly session: SecureSession };
+  | { readonly phase: 'established'; readonly session: SecureSession }
+  /** Plaintext v1 links never have a session; 'plain' means peer proven. */
+  | { readonly phase: 'plain' };
+
+/** How a connection speaks on the wire. */
+type LinkMode = 'secure' | 'plain';
 
 interface Connection {
   socket: net.Socket;
-  /** Reads raw v2 frames off the socket (binary, length-prefixed). */
-  reader: SecureFrameReader;
-  /** Splits decrypted plaintext back into JSON envelopes. */
+  /** Reads raw v2 frames off the socket (binary, length-prefixed); null on plaintext links. */
+  reader: SecureFrameReader | null;
+  /** Splits plaintext back into JSON envelopes (decrypted payload or raw wire). */
   decoder: FrameDecoder;
+  /** secure until the first byte proves otherwise, or when dialled as plain. */
+  mode: LinkMode;
+  /** True once the first chunk decided the mode (sniffing happens once). */
+  sniffed: boolean;
+  /** True once the peer proved itself with a HELLO (both modes). */
+  helloSeen: boolean;
   outbound: boolean;
   handshake: HandshakeState;
   peer: PeerHandle | null;
@@ -165,6 +189,7 @@ export class TcpTransport {
   readonly #clientId: string;
   readonly #identitySeed: Uint8Array;
   readonly #checkPeerPin: ((clientId: string, identityKeyId: string) => PeerPinVerdict) | undefined;
+  readonly #allowPlaintext: boolean;
   readonly #maxPeers: number;
   readonly #helloTimeoutMs: number;
   readonly #pingIntervalMs: number;
@@ -188,6 +213,7 @@ export class TcpTransport {
     this.#clientId = options.clientId;
     this.#identitySeed = options.identitySeed;
     this.#checkPeerPin = options.checkPeerPin;
+    this.#allowPlaintext = options.allowPlaintext ?? false;
     this.#maxPeers = options.maxPeers ?? MAX_PEERS;
     this.#helloTimeoutMs = options.helloTimeoutMs ?? HELLO_TIMEOUT_MS;
     this.#pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
@@ -307,16 +333,37 @@ export class TcpTransport {
   }
 
   /**
-   * Open a link to a peer. The promise resolves once the encrypted handshake
-   * has completed (so callers get a real identity back) and rejects on failure.
+   * Open a link to a peer. The promise resolves once the handshake has
+   * completed (so callers get a real identity back) and rejects on failure.
    * Concurrent calls for the same address share one attempt.
+   *
+   * By default the dial speaks protocol v2; pass `plaintext: true` to dial a
+   * known legacy (v1) peer in plaintext. Plaintext dials are only honoured
+   * when the transport was built with `allowPlaintext`.
    */
+  connect(address: string, port: number, timeoutMs?: number): Promise<PeerHandle>;
   connect(
     address: string,
     port: number,
-    timeoutMs: number = this.#maxConnectTimeoutMs,
+    options: { plaintext?: boolean; timeoutMs?: number },
+  ): Promise<PeerHandle>;
+  connect(
+    address: string,
+    port: number,
+    options: number | { plaintext?: boolean; timeoutMs?: number } = {},
   ): Promise<PeerHandle> {
-    const key = `${address}:${port}`;
+    const plaintext = typeof options === 'object' && options.plaintext === true;
+    const timeoutMs =
+      typeof options === 'number'
+        ? options
+        : (options.timeoutMs ?? this.#maxConnectTimeoutMs);
+
+    if (plaintext && !this.#allowPlaintext) {
+      return Promise.reject(new Error('plaintext links are disabled (use --allow-plaintext)'));
+    }
+
+    const mode: LinkMode = plaintext ? 'plain' : 'secure';
+    const key = `${mode}:${address}:${port}`;
     const existing = this.#pendingConnect.get(key);
     if (existing !== undefined) {
       return existing;
@@ -329,7 +376,7 @@ export class TcpTransport {
       }
 
       const socket = net.connect({ host: address, port });
-      const connection = this.#attach(socket, true);
+      const connection = this.#attach(socket, true, mode);
       connection.settle = { resolve, reject };
 
       const timer = setTimeout(() => {
@@ -410,15 +457,22 @@ export class TcpTransport {
     }
   }
 
-  #attach(socket: net.Socket, outbound: boolean): Connection {
+  #attach(socket: net.Socket, outbound: boolean, mode: LinkMode = 'secure'): Connection {
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 15000);
 
     const now = this.#now();
     const connection: Connection = {
       socket,
-      reader: new SecureFrameReader(),
-      decoder: new FrameDecoder(),
+      reader: mode === 'plain' ? null : new SecureFrameReader(),
+      decoder: new FrameDecoder(
+        mode === 'plain'
+          ? { envelopeOptions: { allowedVersions: SUPPORTED_WIRE_VERSION_SET } }
+          : {},
+      ),
+      mode,
+      sniffed: mode === 'secure' ? false : true,
+      helloSeen: false,
       outbound,
       handshake: { phase: 'awaiting-hello' },
       peer: null,
@@ -449,10 +503,16 @@ export class TcpTransport {
     });
 
     if (outbound) {
-      // Initiator: create a signed ephemeral exchange and send it immediately.
-      const mine = createKeyExchange(this.#identitySeed);
-      connection.handshake = { phase: 'awaiting-reply', mine };
-      this.#sendHello(connection);
+      if (mode === 'plain') {
+        // Dialling a known v1 peer: speak plaintext immediately, no sealed
+        // bytes at all (a v1 peer cannot parse them and may log noise).
+        this.#sendPlainHello(connection);
+      } else {
+        // Initiator: create a signed ephemeral exchange and send it immediately.
+        const mine = createKeyExchange(this.#identitySeed);
+        connection.handshake = { phase: 'awaiting-reply', mine };
+        this.#sendHello(connection);
+      }
     }
 
     return connection;
@@ -461,7 +521,38 @@ export class TcpTransport {
   #onData(connection: Connection, chunk: Buffer): void {
     connection.lastActivity = this.#now();
 
-    const frames = connection.reader.push(chunk);
+    // Sniff once: the first byte decides whether this is a v2 stream (magic
+    // 0xC2) or, when plaintext links are allowed, a legacy v1 stream (JSON
+    // starting with '{'). Sniffing happens before any frame is processed.
+    if (!connection.sniffed && chunk.length > 0 && connection.mode === 'secure') {
+      connection.sniffed = true;
+      if (chunk[0] !== MAGIC_BYTE) {
+        if (!this.#allowPlaintext) {
+          // Same treatment as any other protocol violation.
+          this.#destroy(connection, 'protocol');
+          return;
+        }
+
+        connection.mode = 'plain';
+        connection.reader = null;
+        connection.decoder = new FrameDecoder({
+          envelopeOptions: { allowedVersions: SUPPORTED_WIRE_VERSION_SET },
+        });
+      }
+    }
+
+    if (connection.mode === 'plain') {
+      this.#onPlainData(connection, chunk);
+      return;
+    }
+
+    const reader = connection.reader;
+    if (reader === null) {
+      this.#destroy(connection, 'protocol');
+      return;
+    }
+
+    const frames = reader.push(chunk);
     if (frames === null) {
       // Wrong magic byte or absurd declared length: not a v2 stream.
       this.#destroy(connection, 'protocol');
@@ -515,6 +606,126 @@ export class TcpTransport {
       for (const envelope of envelopes) {
         this.#dispatchEnvelope(connection, envelope);
       }
+    }
+  }
+
+  /**
+   * Plaintext v1 stream: newline-delimited JSON envelopes, no sealing.
+   * Only reachable when `allowPlaintext` is on (or the dial asked for it).
+   */
+  #onPlainData(connection: Connection, chunk: Buffer): void {
+    const envelopes = connection.decoder.push(chunk);
+    const dropped = connection.decoder.stats.dropped;
+    if (dropped > connection.lastDropped) {
+      this.#droppedFrames += dropped - connection.lastDropped;
+      connection.lastDropped = dropped;
+    }
+
+    for (const envelope of envelopes) {
+      if (envelope.type === 'HELLO' && connection.peer === null) {
+        if (!this.#handlePlainHello(connection, envelope)) {
+          return; // connection destroyed inside
+        }
+
+        continue;
+      }
+
+      if (connection.peer === null) {
+        // Data before a HELLO proves the peer: refuse rather than guess.
+        this.#destroy(connection, 'protocol');
+        return;
+      }
+
+      this.#dispatchEnvelope(connection, envelope);
+    }
+  }
+
+  /**
+   * Complete (or refresh the start of) a plaintext v1 link from a HELLO.
+   * Returns false when the connection was (or must be) destroyed.
+   */
+  #handlePlainHello(connection: Connection, envelope: Envelope): boolean {
+    if (envelope.from === this.#clientId) {
+      this.#destroy(connection, 'protocol');
+      return false;
+    }
+
+    const hello = readHelloData(envelope);
+    if (hello === null) {
+      this.#destroy(connection, 'protocol');
+      return false;
+    }
+
+    const duplicate = this.#byClientId.get(envelope.from);
+    if (duplicate !== undefined && duplicate !== connection) {
+      const existing = duplicate.peer;
+      const settle = connection.settle;
+      connection.settle = null;
+      if (existing !== null) {
+        settle?.resolve(existing);
+      }
+
+      this.#destroy(connection, 'duplicate');
+      return false;
+    }
+
+    if (this.#byClientId.size >= this.#maxPeers) {
+      this.#destroy(connection, 'protocol');
+      return false;
+    }
+
+    if (!connection.helloSeen) {
+      connection.helloSeen = true;
+      if (!connection.outbound) {
+        // Acceptor identifies itself in plaintext before any data flows.
+        this.#sendPlainHello(connection);
+      }
+    }
+
+    const peer: PeerHandle = {
+      clientId: envelope.from,
+      username: envelope.username,
+      room: envelope.room,
+      port: hello.port,
+      addresses: hello.addresses,
+      outbound: connection.outbound,
+      remoteAddress: connection.socket.remoteAddress ?? '',
+      remotePort: connection.socket.remotePort ?? 0,
+      connectedAt: this.#now(),
+      latencyMs: null,
+      identityKeyId: '',
+      encrypted: false,
+    };
+
+    connection.peer = peer;
+    connection.handshake = { phase: 'plain' };
+    this.#byClientId.set(peer.clientId, connection);
+
+    const settle = connection.settle;
+    connection.settle = null;
+    settle?.resolve(peer);
+
+    this.#handlers.onPeerReady(peer);
+    return true;
+  }
+
+  /** Send our identity as a plaintext v1 HELLO (newline-delimited JSON). */
+  #sendPlainHello(connection: Connection): void {
+    const identity = this.#handlers.getHello();
+    const envelope = createEnvelope('HELLO', this.#senderIdentity(identity.username), {
+      room: identity.room,
+      data: { port: identity.port, addresses: identity.addresses },
+      version: LEGACY_WIRE_VERSION,
+    });
+
+    try {
+      connection.socket.write(encodeFrame(envelope), error => {
+        if (error !== null && error !== undefined) {
+          this.#destroy(connection, 'error');
+        }
+      });
+    } catch {
+      this.#destroy(connection, 'error');
     }
   }
 
@@ -714,12 +925,12 @@ export class TcpTransport {
   }
 
   /**
-   * Write one envelope on a connection, encrypted once the session is up.
+   * Write one envelope on a connection.
    *
-   * Writes are allowed before the handshake completes (the HELLO itself is
-   * sent as soon as the socket is created, and Node buffers it until the
-   * connection is established). Higher-level sends still go through `sendTo`,
-   * which can only resolve a peer that has already completed the handshake.
+   * Secure links seal the frame once the session is up (the handshake HELLOs
+   * themselves go out as plaintext seq-0 frames); plaintext v1 links write the
+   * JSON line directly, re-stamped to v1. Writes are allowed before the
+   * handshake completes (the HELLO is sent as soon as the socket is created).
    */
   #write(connection: Connection, envelope: Envelope): boolean {
     if (connection.closed) {
@@ -732,9 +943,18 @@ export class TcpTransport {
       return false;
     }
 
-    const frame = encodeFrame(envelope);
+    const version = connection.mode === 'plain' ? LEGACY_WIRE_VERSION : PROTOCOL_VERSION;
+    const wireEnvelope = rewriteEnvelopeForWire(envelope, version);
+    if (wireEnvelope === null) {
+      // Unsupported target version — should be unreachable.
+      return false;
+    }
+
+    const frame = encodeFrame(wireEnvelope);
     let wire: Buffer;
-    if (connection.handshake.phase === 'established') {
+    if (connection.mode === 'plain') {
+      wire = frame;
+    } else if (connection.handshake.phase === 'established') {
       try {
         wire = encodeSecureFrame(connection.handshake.session, frame);
       } catch {
@@ -808,7 +1028,10 @@ export class TcpTransport {
           continue;
         }
 
-        if (connection.handshake.phase !== 'established') {
+        if (
+          connection.handshake.phase !== 'established' &&
+          connection.handshake.phase !== 'plain'
+        ) {
           if (now > connection.helloDeadline) {
             this.#destroy(connection, 'hello-timeout');
           }

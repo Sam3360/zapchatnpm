@@ -81,26 +81,29 @@ Terminal. No shell-specific paths or `/bin/bash` assumptions.
 
 ### Interoperability (npm ↔ Python)
 
-> **Status since npm v2:** cross-stack discovery is currently broken. npm's
-> discovery parser only accepts its own `v: 2` beacons and stamps its own
-> beacons `v: 2`, while the Python client speaks `v: 1` — so the two do not
-> see each other's announcements. v5 restores beacon interop (dual-version
-> beacons) and adds opt-in plaintext links; see the table for what works.
+Since v5, the two stacks **see each other again on the LAN**: every client
+sends its discovery beacon in both wire versions (v1 for the Python client,
+v2 for npm), and accepts both.
 
 Chat compatibility is per-link:
 
-| Link | Works today? | Why |
+| Link | Works? | How |
 | --- | --- | --- |
-| npm ↔ npm | ✅ | Encrypted TCP (protocol v2: X25519 + AES-256-GCM) |
+| npm ↔ npm | ✅ | Encrypted TCP (protocol v2: X25519 + AES-256-GCM) — always on |
 | Python ↔ Python | ✅ | JSON envelopes over TCP (protocol v1) |
-| npm ↔ Python | ❌ not yet | npm v2 refuses v1 peers with an upgrade notice; there is no plaintext fallback by design |
+| npm ↔ Python | ✅ opt-in | npm peer runs with `--allow-plaintext`; the link is then **unencrypted** v1 |
+| npm (no flag) ↔ Python | ❌ refused | Without the flag npm never opens an unencrypted link |
 
-> Both stacks keep the same envelope shapes and limits (`HELLO`, `ANNOUNCE`,
-> `MESSAGE`, …, same size caps, same sanitisation rules), and actions
-> (`/me waves` → `* sam waves`) use the identical CTCP framing on both sides —
-> so the remaining gap is only the transport layer, not the messaging format.
-> A v1 compatibility mode is on the roadmap; tracking it in
-> [issues](https://github.com/Sam3360/zapchatnpm/issues).
+> **The trade-off is real and deliberate.** The Python client cannot do the
+> v2 key exchange, so a cross-stack link is plaintext: anyone capturing LAN
+> traffic can read it. npm therefore refuses these links *by default*, warns
+> loudly when one is opened (`link to X WITHOUT encryption`), and shows a
+> warning in `/status`. Use `--allow-plaintext` when you accept that — e.g.
+> a home network with Python friends.
+>
+> Both stacks keep identical envelope shapes, limits and sanitisation rules,
+> and a relayed message is re-stamped per link, so mixed rooms (npm and
+> Python peers in one mesh) just work.
 
 ## First run
 
@@ -232,6 +235,8 @@ is the port this instance is listening on.
   HKDF and live only for the connection (forward secrecy). This protects
   traffic on your LAN — it is still not anonymous and not a replacement for
   Signal: there is no central authority verifying who anybody "really" is.
+  The one exception is opt-in links to legacy v1 peers (`--allow-plaintext`),
+  which are unencrypted and announced as such.
 - **Internet-free chatting.** With the network cable pulled out but the LAN
   intact, everything still works.
 
@@ -279,6 +284,8 @@ zapchat [options]
       --multicast <address>    discovery multicast group (default 239.255.42.99)
       --tcp-port <port>        first TCP port to try (default 45913)
       --no-discovery           share no beacons; manual connections only
+      --allow-plaintext        allow unencrypted links to legacy (v1) peers
+                               such as the Python client; off by default
       --inline                 render in the normal screen buffer
       --headless               plain text mode: stdin lines are sent, messages print
   -h, --help                   show help

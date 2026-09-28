@@ -13,9 +13,22 @@
  * v2 hardens the TCP mesh: every connection runs an ephemeral X25519 key
  * exchange and all data frames are sealed with AES-256-GCM (see
  * `protocol/crypto.ts`, `protocol/secureFraming.ts`, `protocol/handshake.ts`).
- * There is no fallback to v1 — a v1 peer is refused with an upgrade notice.
+ *
+ * v5 adds an *opt-in* plaintext fallback for talking to protocol v1 peers
+ * (the Python client): discovery accepts both versions, and with
+ * `--allow-plaintext` a v1-only peer can be reached over unencrypted TCP.
+ * Links default to v2; plaintext is never used silently.
  */
 export const PROTOCOL_VERSION = 2;
+
+/** Wire versions this client can parse on the wire (discovery + plaintext TCP). */
+export const SUPPORTED_WIRE_VERSIONS = [1, 2] as const;
+
+/** Version we speak natively and stamp on our own envelopes. */
+export const DEFAULT_WIRE_VERSION = 2;
+
+/** The legacy wire version (the Python client speaks this natively). */
+export const LEGACY_WIRE_VERSION = 1;
 
 /** First byte of every v2 TCP frame; a v1 peer never emits it. */
 export const MAGIC_BYTE = 0xc2;

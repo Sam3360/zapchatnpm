@@ -22,6 +22,7 @@ import {
   MAX_MESSAGE_CHARS,
   MAX_PEERS,
   PROTOCOL_VERSION,
+  SUPPORTED_WIRE_VERSIONS,
 } from './constants.js';
 import {
   charLength,
@@ -137,6 +138,8 @@ export interface CreateEnvelopeOptions {
   ts?: number;
   room?: string | null;
   data?: unknown;
+  /** Wire version to stamp (default: our native version). */
+  version?: number;
 }
 
 /** Build an envelope from an identity. Senders always use this helper. */
@@ -146,7 +149,7 @@ export function createEnvelope(
   options: CreateEnvelopeOptions = {},
 ): Envelope {
   return {
-    v: PROTOCOL_VERSION,
+    v: options.version ?? PROTOCOL_VERSION,
     id: options.id ?? newMessageId(),
     type,
     ts: options.ts ?? Date.now(),
@@ -157,8 +160,38 @@ export function createEnvelope(
   };
 }
 
+const DEFAULT_WIRE_VERSION_SET: ReadonlySet<number> = new Set([PROTOCOL_VERSION]);
+
+/** Set of every wire version this build can parse (discovery + plaintext links). */
+export const SUPPORTED_WIRE_VERSION_SET: ReadonlySet<number> = new Set<number>(SUPPORTED_WIRE_VERSIONS);
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export interface ParseEnvelopeResult {
+  envelope: Envelope;
+  /** Wire version the sender used (1 = legacy/Python, 2 = encrypted-capable). */
+  wireVersion: number;
+}
+
+/**
+ * Re-stamp an envelope for a peer that speaks a different wire version.
+ *
+ * Envelope shapes are identical across v1 and v2 (same routing metadata, same
+ * payloads), so relaying a v1-sourced message to a v2 peer is a pure version
+ * rewrite: the id, timestamps and text are untouched. Returns null when the
+ * target version is unsupported, so callers drop rather than guess.
+ */
+export function rewriteEnvelopeForWire(
+  envelope: Envelope,
+  targetVersion: number,
+): Envelope | null {
+  if (!SUPPORTED_WIRE_VERSION_SET.has(targetVersion) || envelope.v === targetVersion) {
+    return envelope.v === targetVersion ? envelope : null;
+  }
+
+  return { ...envelope, v: targetVersion };
 }
 
 /**
@@ -366,6 +399,8 @@ export interface ParseEnvelopeOptions {
   now?: number;
   /** Set to false to accept envelopes with a skewed timestamp. */
   checkClockSkew?: boolean;
+  /** Wire versions to accept (default: our native version only). */
+  allowedVersions?: ReadonlySet<number>;
 }
 
 /**
@@ -382,9 +417,13 @@ export function parseEnvelope(
     return null;
   }
 
-  if (value['v'] !== PROTOCOL_VERSION) {
+  const allowed = options.allowedVersions ?? DEFAULT_WIRE_VERSION_SET;
+  const rawVersion = value['v'];
+  if (typeof rawVersion !== 'number' || !allowed.has(rawVersion)) {
     return null;
   }
+  // Remember the version the peer speaks so per-link behaviour can adapt.
+  const wireVersion = rawVersion;
 
   const id = value['id'];
   if (typeof id !== 'string' || !ENVELOPE_ID_PATTERN.test(id)) {
@@ -419,7 +458,7 @@ export function parseEnvelope(
   }
 
   const envelope: Envelope = {
-    v: PROTOCOL_VERSION,
+    v: wireVersion,
     id,
     type: type as MessageType,
     ts,

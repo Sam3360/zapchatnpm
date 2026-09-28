@@ -18,6 +18,7 @@ export function makePeer(overrides: Partial<PeerSnapshot> = {}): PeerSnapshot {
     addresses: ['192.168.1.9'],
     latencyMs: 5,
     source: 'lan',
+    wireVersion: 2,
     ...overrides,
   };
 }
@@ -37,6 +38,7 @@ export function makeStatus(overrides: Partial<StatusSnapshot> = {}): StatusSnaps
     droppedFrames: 0,
     lan: '192.168.1.42/24',
     warnings: [],
+    plaintextLinks: 0,
     ...overrides,
   };
 }

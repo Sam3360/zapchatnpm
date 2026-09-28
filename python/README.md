@@ -9,11 +9,12 @@ and an npm user on the same Wi-Fi can chat with each other.
 
 > The Python client runs the proven protocol v1 wire format (JSON envelopes
 > over TCP, discovery beacons). The Node.js client's protocol v2 adds
-> TLS-style encryption on top of the same envelope shapes. Note: since npm v2,
-> the two stacks do **not** currently see each other's discovery beacons (the
-> npm parser only accepts its own `v: 2` beacons) and npm refuses v1 chat
-> links. npm ↔ npm and Python ↔ Python chat work today; beacon interop and an
-> opt-in plaintext bridge are coming in v5.
+> TLS-style encryption on top of the same envelope shapes. Since zapchat v5
+> the stacks see each other's discovery beacons again, and an npm peer that
+> runs with `--allow-plaintext` will chat with you over an **unencrypted** v1
+> link (the npm side warns loudly about this). npm ↔ npm links stay
+> end-to-end encrypted; if the npm user does not opt in, no cross-stack link
+> is opened.
 
 ## Install
 

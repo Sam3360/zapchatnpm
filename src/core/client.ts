@@ -15,8 +15,10 @@ import {
   DEFAULT_DISCOVERY_PORT,
   DEFAULT_ROOM,
   DEFAULT_TCP_PORT_BASE,
+  LEGACY_WIRE_VERSION,
   MAX_ROOM_NAME_LENGTH,
   MAX_USERNAME_LENGTH,
+  PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   SWEEP_INTERVAL_MS,
@@ -68,6 +70,8 @@ export interface PeerSnapshot {
   addresses: string[];
   latencyMs: number | null;
   source: PeerRecord['source'];
+  /** Wire version the peer speaks (1 = legacy/Python, 2 = encrypted-capable). */
+  wireVersion: number;
 }
 
 export interface NoticeSnapshot {
@@ -90,6 +94,8 @@ export interface StatusSnapshot {
   droppedFrames: number;
   lan: string;
   warnings: string[];
+  /** Number of established links running without encryption. */
+  plaintextLinks: number;
 }
 
 export interface Snapshot {
@@ -116,6 +122,11 @@ export interface ZapClientOptions {
   discoveryPort?: number;
   multicastAddress?: string;
   tcpPortBase?: number;
+  /**
+   * Opt-in (v5): allow unencrypted protocol v1 links to legacy peers (the
+   * Python client). Default off; every plaintext link is announced loudly.
+   */
+  allowPlaintext?: boolean;
   configPath?: string;
   staleMs?: number;
   /** Extra config lookup options (tests inject env/platform). */
@@ -168,6 +179,8 @@ export class ZapClient {
   readonly #attempts = new Map<string, AttemptState>();
   /** Peers we have shown a "reconnecting" notice for. */
   readonly #reconnecting = new Set<string>();
+  /** Peers we have warned about legacy-protocol plaintext dials (v5). */
+  readonly #legacyWarned = new Set<string>();
   #peerListDirty = false;
 
   constructor(options: ZapClientOptions = {}) {
@@ -293,6 +306,7 @@ export class ZapClient {
 
           return verdict;
         },
+        allowPlaintext: this.#options.allowPlaintext === true,
         now: this.#now,
       },
     );
@@ -595,7 +609,32 @@ export class ZapClient {
     this.#emit();
 
     try {
-      const peer = await transport.connect(host, targetPort);
+      // Manual connects try v2 first; if the peer only speaks legacy v1 it
+      // stays silent and the v2 dial times out — then we retry once in
+      // plaintext when (and only when) the user allowed plaintext links.
+      let peer: Awaited<ReturnType<typeof transport.connect>>;
+      try {
+        peer = await transport.connect(host, targetPort);
+      } catch (v2Error) {
+        const existing = transport
+          .peers()
+          .find(
+            candidate =>
+              candidate.port === targetPort &&
+              (candidate.remoteAddress === host || candidate.addresses.includes(host)),
+          );
+        if (existing !== undefined) {
+          this.#setNotice('ok', `already connected to ${existing.username}`);
+          this.#emit();
+          return { ok: true };
+        }
+
+        if (this.#options.allowPlaintext === true) {
+          peer = await transport.connect(host, targetPort, { plaintext: true });
+        } else {
+          throw v2Error;
+        }
+      }
       this.#setNotice('ok', `connected to ${peer.username} (${host}:${targetPort})`);
       this.#emit();
       return { ok: true };
@@ -689,7 +728,7 @@ export class ZapClient {
     return sanitizeRoomName(input, MAX_ROOM_NAME_LENGTH);
   }
 
-  #onAnnounce(peer: PeerContact & { rooms: string[] }, address: string): void {
+  #onAnnounce(peer: PeerContact & { rooms: string[]; wireVersion: number }, address: string): void {
     if (peer.clientId === this.#clientId) {
       return;
     }
@@ -699,6 +738,7 @@ export class ZapClient {
       { ...peer, addresses: [address, ...peer.addresses] },
       'lan',
       now,
+      { wireVersion: peer.wireVersion },
     );
 
     for (const room of peer.rooms) {
@@ -726,6 +766,9 @@ export class ZapClient {
       },
       'tcp',
       now,
+      // The link itself is the ground truth: a plaintext link makes the peer
+      // legacy regardless of what its beacon claimed.
+      { wireVersion: peer.encrypted ? PROTOCOL_VERSION : LEGACY_WIRE_VERSION },
     );
 
     this.#registry.setPeerConnection(peer.clientId, true, now);
@@ -743,7 +786,14 @@ export class ZapClient {
     this.#sendPeerList(peer.clientId);
     this.#peerListDirty = true;
 
-    this.#log(`connected to ${peer.username} (${peer.remoteAddress})`, 'info');
+    if (!peer.encrypted) {
+      this.#log(
+        `linked to ${record.username} WITHOUT encryption (legacy v1 peer) — chat content travels in clear text`,
+        'warn',
+      );
+    }
+
+    this.#log(`connected to ${record.username} (${peer.remoteAddress})`, 'info');
     this.#markDirty();
     this.#emit();
   }
@@ -974,8 +1024,20 @@ export class ZapClient {
       return;
     }
 
+    // A peer advertising v1 in its beacon is legacy (e.g. the Python client):
+    // dial it in plaintext only when the user opted in via --allow-plaintext;
+    // otherwise leave it alone (a v2 dial against a v1 peer just times out).
+    const legacy = peer.wireVersion === LEGACY_WIRE_VERSION;
+    if (legacy && this.#options.allowPlaintext === true && !this.#legacyWarned.has(peer.clientId)) {
+      this.#legacyWarned.add(peer.clientId);
+      this.#log(
+        `${peer.username} speaks the legacy protocol; connecting without encryption (plaintext)`,
+        'warn',
+      );
+    }
+
     void this.#transport
-      .connect(address, peer.port)
+      .connect(address, peer.port, legacy && this.#options.allowPlaintext === true ? { plaintext: true } : {})
       .then(connected => {
         this.#attempts.delete(connected.clientId);
       })
@@ -1209,6 +1271,7 @@ export class ZapClient {
         droppedFrames: discovery.dropped + (this.#transport?.droppedFrames ?? 0),
         lan: describeNetwork(this.#options.networkInterfaces?.() ?? os.networkInterfaces()),
         warnings: [...this.#warnings],
+        plaintextLinks: peers.filter(record => record.connected && record.wireVersion === LEGACY_WIRE_VERSION).length,
       },
     };
   }
@@ -1223,6 +1286,7 @@ export class ZapClient {
       addresses: [...record.addresses],
       latencyMs: record.latencyMs,
       source: record.source,
+      wireVersion: record.wireVersion,
     };
   }
 

@@ -14,6 +14,7 @@
 import {
   DEDUP_CACHE_SIZE,
   DEDUP_WINDOW_MS,
+  DEFAULT_WIRE_VERSION,
   HISTORY_LIMIT,
   KNOWN_ROOM_TTL_MS,
   PEER_STALE_MS,
@@ -40,6 +41,8 @@ export interface PeerRecord {
   connectedAt: number | null;
   /** Round-trip time of the last PONG, when known. */
   latencyMs: number | null;
+  /** Wire version the peer was last seen speaking (1 = legacy, 2 = v2-capable). */
+  wireVersion: number;
 }
 
 export interface RoomSummary {
@@ -81,6 +84,11 @@ export interface UpsertPeerResult {
   added: boolean;
   /** Previous room, so callers can emit join/leave notices. */
   previousRoom: string | null;
+}
+
+export interface UpsertPeerOptions {
+  /** Wire version advertised by the peer (beacons) or negotiated (links). */
+  wireVersion?: number;
 }
 
 export class RoomRegistry {
@@ -169,6 +177,7 @@ export class RoomRegistry {
     contact: PeerContact,
     source: PeerSource,
     now: number = Date.now(),
+    options: UpsertPeerOptions = {},
   ): UpsertPeerResult {
     const existing = this.#peers.get(contact.clientId);
     if (existing === undefined) {
@@ -183,6 +192,7 @@ export class RoomRegistry {
         connected: false,
         connectedAt: null,
         latencyMs: null,
+        wireVersion: options.wireVersion ?? DEFAULT_WIRE_VERSION,
       };
       this.#peers.set(peer.clientId, peer);
       if (peer.room !== null) {
@@ -198,6 +208,9 @@ export class RoomRegistry {
     existing.port = contact.port;
     existing.addresses = mergeAddresses(existing.addresses, contact.addresses);
     existing.lastSeen = now;
+    if (options.wireVersion !== undefined) {
+      existing.wireVersion = options.wireVersion;
+    }
     if (source === 'manual') {
       existing.source = 'manual';
     } else if (existing.source === 'lan' && source === 'tcp') {

@@ -169,6 +169,12 @@ export function runCommand(parsed: ParsedCommand, context: CommandContext): Comm
         `peers       ${status.peersOnline} on LAN, ${status.peersConnected} connected · ${status.beaconsSent} beacons sent, ${status.beaconsReceived} received`,
         'info',
       );
+      if (status.plaintextLinks > 0) {
+        print(
+          `encryption   WARNING: ${status.plaintextLinks} link(s) without encryption (legacy peers)`,
+          'warn',
+        );
+      }
       print(`protocol    ${status.droppedFrames} rejected frames so far`, 'info');
       if (status.warnings.length > 0) {
         for (const warning of status.warnings) {

@@ -58,6 +58,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     // the TUI lands in the lobby so the user can see what is on the LAN.
     room: options.headless ? (options.room ?? DEFAULT_ROOM) : (options.room ?? null),
     discovery: options.discovery,
+    allowPlaintext: options.allowPlaintext,
     ...(options.discoveryPort === undefined ? {} : { discoveryPort: options.discoveryPort }),
     ...(options.multicastAddress === undefined ? {} : { multicastAddress: options.multicastAddress }),
     ...(options.tcpPort === undefined ? {} : { tcpPortBase: options.tcpPort }),

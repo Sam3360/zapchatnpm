@@ -29,6 +29,9 @@ Options
       --multicast <address>    discovery multicast group (default ${DEFAULT_MULTICAST_ADDRESS})
       --tcp-port <port>        first TCP port to try (default ${DEFAULT_TCP_PORT_BASE})
       --no-discovery           share no beacons; manual connections only
+      --allow-plaintext        permit unencrypted links to legacy (v1) peers,
+                               e.g. the Python client. Off by default: chat
+                               content on such links is NOT encrypted
       --inline                 render in the normal screen buffer
       --headless               plain text mode for scripting and debugging:
                                lines from stdin are sent, incoming messages print
@@ -51,6 +54,8 @@ export interface CliOptions {
   connect?: string;
   headless: boolean;
   discovery: boolean;
+  /** Opt-in: accept/open unencrypted v1 links (legacy peers). */
+  allowPlaintext: boolean;
   discoveryPort?: number;
   multicastAddress?: string;
   tcpPort?: number;
@@ -66,6 +71,7 @@ const DEFAULT_OPTIONS: CliOptions = {
   version: false,
   headless: false,
   discovery: true,
+  allowPlaintext: false,
   alternateScreen: true,
 };
 
@@ -116,6 +122,10 @@ export function parseArgs(argv: readonly string[]): ParseResult {
 
       case '--no-discovery':
         options.discovery = false;
+        break;
+
+      case '--allow-plaintext':
+        options.allowPlaintext = true;
         break;
 
       case '--inline':
