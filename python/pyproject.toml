@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zapchat"
+version = "3.0.0"
+description = "Terminal-native LAN chat. No accounts, no cloud, no servers - just your local network."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Samarth Chugh (Sam3360)" }]
+keywords = ["lan", "chat", "cli", "terminal", "p2p", "udp", "discovery", "local-network"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: Chat",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2"]
+
+[project.scripts]
+zapchat = "zapchat.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Sam3360/zapchatnpm"
+Repository = "https://github.com/Sam3360/zapchatnpm"
+Issues = "https://github.com/Sam3360/zapchatnpm/issues"
+
+[tool.setuptools]
+packages = ["zapchat"]
