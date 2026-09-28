@@ -85,6 +85,11 @@ export interface HelloData {
   port: number;
   /** IPv4 addresses the sender believes it can be reached on. */
   addresses: string[];
+  /**
+   * Protocol v2 key exchange: ephemeral X25519 public key, its fingerprint and
+   * a fresh nonce (all base64). Present in every v2 HELLO.
+   */
+  keyExchange?: Record<string, unknown>;
 }
 
 export interface AnnounceData extends HelloData {
@@ -190,7 +195,19 @@ export function parseHelloData(data: unknown): HelloData | null {
     return null;
   }
 
-  return { port, addresses: sanitizeAddressList(data['addresses'], MAX_ADDRESSES) };
+  // The key exchange is opaque here (validated by protocol/handshake.ts); keep
+  // it only when it is a plain object so the envelope shape stays strict.
+  const keyExchangeRaw = data['keyExchange'];
+  const keyExchange: Record<string, unknown> | undefined =
+    typeof keyExchangeRaw === 'object' && keyExchangeRaw !== null && !Array.isArray(keyExchangeRaw)
+      ? (keyExchangeRaw as Record<string, unknown>)
+      : undefined;
+
+  return {
+    port,
+    addresses: sanitizeAddressList(data['addresses'], MAX_ADDRESSES),
+    ...(keyExchange !== undefined ? { keyExchange } : {}),
+  };
 }
 
 export function parseAnnounceData(data: unknown): AnnounceData | null {

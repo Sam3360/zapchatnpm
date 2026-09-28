@@ -7,36 +7,55 @@
  * other at the same moment the duplicate is closed deterministically so exactly
  * one link survives.
  *
- * On connection:
- *   1. the initiator sends HELLO immediately;
- *   2. the acceptor replies with its own HELLO and only then considers the peer
- *      usable, so identity always comes from a validated HELLO, never from an
- *      address;
- *   3. PING/PONG keep the link warm and detect half-open sockets (common on
- *      Wi-Fi when a laptop sleeps).
+ * On connection (protocol v2 — encrypted):
+ *   1. the initiator sends a HELLO carrying a signed ephemeral key exchange;
+ *   2. the acceptor verifies the signature and its TOFU pin for the peer's
+ *      identity key, completes the ECDH, and replies with its own signed HELLO;
+ *   3. both sides now hold directional AES-256-GCM session keys; every later
+ *      frame is sealed and sequence-numbered (see `protocol/secureFraming.ts`);
+ *   4. PING/PONG keep the link warm and detect half-open sockets.
  *
- * Frames that arrive before HELLO, oversized frames and unparseable JSON are
- * dropped: a connection that violates the protocol is closed, never trusted.
+ * A connection that never completes the handshake is dropped at the hello
+ * deadline. Any bad magic byte, oversized frame, replayed sequence number or
+ * frame that fails to decrypt is a protocol violation: the connection is
+ * destroyed, never trusted. A peer whose identity key does not match the pin
+ * we hold is refused (`tofu-mismatch`).
  */
 
 import net from 'node:net';
 import {
   DEFAULT_TCP_PORT_BASE,
   HELLO_TIMEOUT_MS,
-  MAX_FRAME_BYTES,
   MAX_PEERS,
   MAX_PENDING_WRITE_BYTES,
   PEER_SILENCE_MS,
   PING_INTERVAL_MS,
   TCP_PORT_ATTEMPTS,
 } from '../protocol/constants.js';
-import { FrameDecoder, encodeFrame } from '../protocol/framing.js';
+import { encodeFrame, FrameDecoder } from '../protocol/framing.js';
+import {
+  createKeyExchange,
+  encodeKeyExchangeForWire,
+  parseKeyExchangeFromWire,
+  runHandshake,
+  type HelloKeyExchange,
+} from '../protocol/handshake.js';
 import {
   createEnvelope,
   readHelloData,
+  parseEnvelope,
   type Envelope,
   type HelloData,
 } from '../protocol/messages.js';
+import {
+  createSecureSession,
+  decodeSecurePayload,
+  encodeHandshakeFrame,
+  encodeSecureFrame,
+  SecureFrameReader,
+  SEQ_HANDSHAKE,
+  type SecureSession,
+} from '../protocol/secureFraming.js';
 
 export type PeerGoneReason =
   | 'closed'
@@ -45,6 +64,7 @@ export type PeerGoneReason =
   | 'hello-timeout'
   | 'duplicate'
   | 'protocol'
+  | 'tofu-mismatch'
   | 'shutdown';
 
 export interface PeerHandle {
@@ -62,6 +82,10 @@ export interface PeerHandle {
   remotePort: number;
   connectedAt: number;
   latencyMs: number | null;
+  /** Fingerprint of the peer's long-term identity key (TOFU). */
+  identityKeyId: string;
+  /** Always true in protocol v2: every link is encrypted. */
+  encrypted: true;
 }
 
 export interface TransportHandlers {
@@ -79,10 +103,15 @@ export interface TransportHandlers {
   onWarning?: (message: string, error?: unknown) => void;
 }
 
+export type PeerPinVerdict = 'ok' | 'new' | 'mismatch';
+
 export interface TransportOptions {
   clientId: string;
+  /** Our long-term Ed25519 identity seed (signs every handshake). */
+  identitySeed: Uint8Array;
+  /** TOFU pin check; return 'mismatch' to refuse the peer. */
+  checkPeerPin?: (clientId: string, identityKeyId: string) => PeerPinVerdict;
   maxPeers?: number;
-  maxFrameBytes?: number;
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
   silenceTimeoutMs?: number;
@@ -91,10 +120,30 @@ export interface TransportOptions {
   now?: () => number;
 }
 
+/** Handshake progress for one connection. */
+type HandshakeState =
+  | { readonly phase: 'awaiting-hello' }
+  | {
+      readonly phase: 'awaiting-reply';
+      /** Our ephemeral private key and the exchange we sent. */
+      readonly mine: { privateKey: Buffer; exchange: HelloKeyExchange };
+    }
+  | {
+      readonly phase: 'answering';
+      /** Our reply HELLO must carry this exchange, unencrypted, before data. */
+      readonly mine: { privateKey: Buffer; exchange: HelloKeyExchange };
+      readonly session: SecureSession;
+    }
+  | { readonly phase: 'established'; readonly session: SecureSession };
+
 interface Connection {
   socket: net.Socket;
+  /** Reads raw v2 frames off the socket (binary, length-prefixed). */
+  reader: SecureFrameReader;
+  /** Splits decrypted plaintext back into JSON envelopes. */
   decoder: FrameDecoder;
   outbound: boolean;
+  handshake: HandshakeState;
   peer: PeerHandle | null;
   createdAt: number;
   lastActivity: number;
@@ -107,12 +156,15 @@ interface Connection {
   lastDropped: number;
   /** Reject the `connect()` promise when a pending link dies. */
   settle: { resolve: (peer: PeerHandle) => void; reject: (error: Error) => void } | null;
+  /** Deadline for the handshake (hello timeout) while not established. */
   helloDeadline: number;
 }
 
 export class TcpTransport {
   readonly #handlers: TransportHandlers;
   readonly #clientId: string;
+  readonly #identitySeed: Uint8Array;
+  readonly #checkPeerPin: ((clientId: string, identityKeyId: string) => PeerPinVerdict) | undefined;
   readonly #maxPeers: number;
   readonly #helloTimeoutMs: number;
   readonly #pingIntervalMs: number;
@@ -120,7 +172,6 @@ export class TcpTransport {
   readonly #maxPendingWriteBytes: number;
   readonly #maxConnectTimeoutMs: number;
   readonly #now: () => number;
-  readonly #maxFrameBytes: number;
 
   #server: net.Server | null = null;
   #serverPort = 0;
@@ -135,8 +186,9 @@ export class TcpTransport {
   constructor(handlers: TransportHandlers, options: TransportOptions) {
     this.#handlers = handlers;
     this.#clientId = options.clientId;
+    this.#identitySeed = options.identitySeed;
+    this.#checkPeerPin = options.checkPeerPin;
     this.#maxPeers = options.maxPeers ?? MAX_PEERS;
-    this.#maxFrameBytes = options.maxFrameBytes ?? MAX_FRAME_BYTES;
     this.#helloTimeoutMs = options.helloTimeoutMs ?? HELLO_TIMEOUT_MS;
     this.#pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
     this.#silenceTimeoutMs = options.silenceTimeoutMs ?? PEER_SILENCE_MS;
@@ -157,7 +209,7 @@ export class TcpTransport {
     return [...this.#byClientId.keys()];
   }
 
-  /** Frames received from peers that failed validation (bad JSON, oversized, bad shape). */
+  /** Frames received from peers that failed validation (bad JSON, bad shape). */
   get droppedFrames(): number {
     return this.#droppedFrames;
   }
@@ -255,8 +307,8 @@ export class TcpTransport {
   }
 
   /**
-   * Open a link to a peer. The promise resolves once the peer's HELLO has been
-   * validated (so callers get a real identity back) and rejects on failure.
+   * Open a link to a peer. The promise resolves once the encrypted handshake
+   * has completed (so callers get a real identity back) and rejects on failure.
    * Concurrent calls for the same address share one attempt.
    */
   connect(
@@ -365,8 +417,10 @@ export class TcpTransport {
     const now = this.#now();
     const connection: Connection = {
       socket,
-      decoder: new FrameDecoder({ maxFrameBytes: this.#maxFrameBytes }),
+      reader: new SecureFrameReader(),
+      decoder: new FrameDecoder(),
       outbound,
+      handshake: { phase: 'awaiting-hello' },
       peer: null,
       createdAt: now,
       lastActivity: now,
@@ -395,6 +449,9 @@ export class TcpTransport {
     });
 
     if (outbound) {
+      // Initiator: create a signed ephemeral exchange and send it immediately.
+      const mine = createKeyExchange(this.#identitySeed);
+      connection.handshake = { phase: 'awaiting-reply', mine };
       this.#sendHello(connection);
     }
 
@@ -404,77 +461,153 @@ export class TcpTransport {
   #onData(connection: Connection, chunk: Buffer): void {
     connection.lastActivity = this.#now();
 
-    const frames = connection.decoder.push(chunk);
-    const dropped = connection.decoder.stats.dropped;
-    if (dropped > connection.lastDropped) {
-      this.#droppedFrames += dropped - connection.lastDropped;
-      connection.lastDropped = dropped;
+    const frames = connection.reader.push(chunk);
+    if (frames === null) {
+      // Wrong magic byte or absurd declared length: not a v2 stream.
+      this.#destroy(connection, 'protocol');
+      return;
     }
 
     for (const frame of frames) {
-      if (connection.peer === null) {
-        this.#handleHandshake(connection, frame);
+      if (frame.seq === SEQ_HANDSHAKE) {
+        if (
+          connection.handshake.phase !== 'awaiting-hello' &&
+          connection.handshake.phase !== 'awaiting-reply'
+        ) {
+          // Handshake frames after the exchange started/finished are nonsense.
+          this.#destroy(connection, 'protocol');
+          return;
+        }
+
+        if (!this.#handleHandshakeFrame(connection, frame.payload)) {
+          return; // connection destroyed inside
+        }
+
         continue;
       }
 
-      switch (frame.type) {
-        case 'PING': {
-          const pong = createEnvelope('PONG', this.#senderIdentity(), { data: null });
-          this.#write(connection, pong);
-          break;
-        }
+      if (connection.handshake.phase !== 'established') {
+        // Encrypted frame before the session exists: hostile.
+        this.#destroy(connection, 'protocol');
+        return;
+      }
 
-        case 'PONG': {
-          if (connection.pingSentAt !== null) {
-            const latency = Math.max(0, this.#now() - connection.pingSentAt);
-            connection.pingSentAt = null;
-            connection.peer.latencyMs = latency;
-            this.#handlers.onPeerLatency?.(connection.peer, latency);
-          }
+      const plain = decodeSecurePayload(
+        connection.handshake.session,
+        frame.seq,
+        frame.head,
+        frame.payload,
+      );
 
-          break;
-        }
+      if (plain === null) {
+        // Replay, gap, tampering or wrong key — none of which we tolerate.
+        this.#destroy(connection, 'protocol');
+        return;
+      }
 
-        case 'HELLO': {
-          // Identity refresh from a known peer (e.g. username change).
-          const hello = readHelloData(frame);
-          if (hello !== null) {
-            connection.peer.username = frame.username;
-            connection.peer.room = frame.room;
-            connection.peer.port = hello.port;
-            connection.peer.addresses = hello.addresses;
-            this.#handlers.onEnvelope(frame, connection.peer);
-          }
+      const envelopes = connection.decoder.push(plain);
+      const dropped = connection.decoder.stats.dropped;
+      if (dropped > connection.lastDropped) {
+        this.#droppedFrames += dropped - connection.lastDropped;
+        connection.lastDropped = dropped;
+      }
 
-          break;
-        }
-
-        default: {
-          this.#handlers.onEnvelope(frame, connection.peer);
-        }
+      for (const envelope of envelopes) {
+        this.#dispatchEnvelope(connection, envelope);
       }
     }
   }
 
-  #handleHandshake(connection: Connection, frame: Envelope): void {
-    if (frame.type !== 'HELLO') {
-      // Anything before HELLO is a protocol violation.
+  #dispatchEnvelope(connection: Connection, frame: Envelope): void {
+    if (connection.peer === null) {
       this.#destroy(connection, 'protocol');
       return;
     }
 
-    if (frame.from === this.#clientId) {
+    switch (frame.type) {
+      case 'PING': {
+        const pong = createEnvelope('PONG', this.#senderIdentity(), { data: null });
+        this.#write(connection, pong);
+        break;
+      }
+
+      case 'PONG': {
+        if (connection.pingSentAt !== null) {
+          const latency = Math.max(0, this.#now() - connection.pingSentAt);
+          connection.pingSentAt = null;
+          connection.peer.latencyMs = latency;
+          this.#handlers.onPeerLatency?.(connection.peer, latency);
+        }
+
+        break;
+      }
+
+      case 'HELLO': {
+        // Identity refresh from a known peer (e.g. username change).
+        const hello = readHelloData(frame);
+        if (hello !== null) {
+          connection.peer.username = frame.username;
+          connection.peer.room = frame.room;
+          connection.peer.port = hello.port;
+          connection.peer.addresses = hello.addresses;
+          this.#handlers.onEnvelope(frame, connection.peer);
+        }
+
+        break;
+      }
+
+      default: {
+        this.#handlers.onEnvelope(frame, connection.peer);
+      }
+    }
+  }
+
+  /**
+   * Handle a seq-0 handshake frame. Returns false when the connection was (or
+   * must be) destroyed.
+   */
+  #handleHandshakeFrame(connection: Connection, payload: Buffer): boolean {
+    // Parse the HELLO envelope inside the plaintext handshake frame.
+    let raw: unknown;
+    try {
+      raw = JSON.parse(payload.toString('utf8'));
+    } catch {
       this.#destroy(connection, 'protocol');
-      return;
+      return false;
     }
 
-    const hello = readHelloData(frame);
-    if (hello === null) {
+    const envelope = parseEnvelope(raw, { now: this.#now() });
+    if (envelope === null || envelope.type !== 'HELLO' || envelope.from === this.#clientId) {
       this.#destroy(connection, 'protocol');
-      return;
+      return false;
     }
 
-    const duplicate = this.#byClientId.get(frame.from);
+    const hello = readHelloData(envelope);
+    if (hello === null || hello.keyExchange === undefined) {
+      this.#destroy(connection, 'protocol');
+      return false;
+    }
+
+    const exchange = parseKeyExchangeFromWire(hello.keyExchange);
+    if (exchange === null) {
+      // Malformed, badly signed, or signed by an unknown key.
+      this.#destroy(connection, 'protocol');
+      return false;
+    }
+
+    // TOFU: refuse an identity key that changed for a client id we know.
+    if (this.#checkPeerPin !== undefined) {
+      const verdict = this.#checkPeerPin(envelope.from, exchange.identityKeyId);
+      if (verdict === 'mismatch') {
+        this.#handlers.onWarning?.(
+          `peer ${envelope.username} (${envelope.from}) presented a different identity key; refusing`,
+        );
+        this.#destroy(connection, 'tofu-mismatch');
+        return false;
+      }
+    }
+
+    const duplicate = this.#byClientId.get(envelope.from);
     if (duplicate !== undefined && duplicate !== connection) {
       // Both sides dialled at once (or the user connected manually to someone we
       // already talk to). The established link wins, and a pending `connect()`
@@ -487,18 +620,51 @@ export class TcpTransport {
       }
 
       this.#destroy(connection, 'duplicate');
-      return;
+      return false;
     }
 
     if (this.#byClientId.size >= this.#maxPeers) {
       this.#destroy(connection, 'protocol');
-      return;
+      return false;
+    }
+
+    let session: SecureSession;
+    if (connection.handshake.phase === 'awaiting-reply') {
+      // We are the initiator: the HKDF salt is our own nonce.
+      const mine = connection.handshake.mine;
+      const result = runHandshake(mine.privateKey, exchange, mine.exchange.nonce, true);
+      if (result === null) {
+        this.#destroy(connection, 'protocol');
+        return false;
+      }
+
+      session = createSecureSession(result.keys.send, result.keys.recv);
+    } else {
+      // We are the acceptor: create our exchange now; the HKDF salt is the
+      // initiator's nonce (the exchange we just received). Our reply HELLO —
+      // carrying this exact exchange — must go out as a plaintext seq-0 frame
+      // before the session switches on, hence the 'answering' phase.
+      const mine = createKeyExchange(this.#identitySeed);
+      const result = runHandshake(mine.privateKey, exchange, exchange.nonce, false);
+      if (result === null) {
+        this.#destroy(connection, 'protocol');
+        return false;
+      }
+
+      session = createSecureSession(result.keys.send, result.keys.recv);
+      connection.handshake = { phase: 'answering', mine, session };
+      this.#sendHello(connection); // plaintext seq-0 frame with our exchange
+      connection.handshake = { phase: 'established', session };
+    }
+
+    if (connection.handshake.phase !== 'established') {
+      connection.handshake = { phase: 'established', session };
     }
 
     const peer: PeerHandle = {
-      clientId: frame.from,
-      username: frame.username,
-      room: frame.room,
+      clientId: envelope.from,
+      username: envelope.username,
+      room: envelope.room,
       port: hello.port,
       addresses: hello.addresses,
       outbound: connection.outbound,
@@ -506,26 +672,32 @@ export class TcpTransport {
       remotePort: connection.socket.remotePort ?? 0,
       connectedAt: this.#now(),
       latencyMs: null,
+      identityKeyId: exchange.identityKeyId,
+      encrypted: true,
     };
 
     connection.peer = peer;
     this.#byClientId.set(peer.clientId, connection);
-
-    // The acceptor answers with its own HELLO so both ends are identified.
-    if (!connection.outbound) {
-      this.#sendHello(connection);
-    }
 
     const settle = connection.settle;
     connection.settle = null;
     settle?.resolve(peer);
 
     this.#handlers.onPeerReady(peer);
+    return true;
   }
 
   #sendHello(connection: Connection): void {
     const identity = this.#handlers.getHello();
     const data: HelloData = { port: identity.port, addresses: identity.addresses };
+
+    if (connection.handshake.phase === 'awaiting-reply' || connection.handshake.phase === 'answering') {
+      // The HELLO that completes the key exchange carries our signed exchange;
+      // it is always sent as a plaintext seq-0 frame.
+      data.keyExchange = encodeKeyExchangeForWire(connection.handshake.mine.exchange);
+    }
+    // Refresh HELLOs (post-handshake identity updates) need no key exchange.
+
     const envelope = createEnvelope('HELLO', this.#senderIdentity(identity.username), {
       room: identity.room,
       data,
@@ -542,12 +714,12 @@ export class TcpTransport {
   }
 
   /**
-   * Write one frame on a connection.
+   * Write one envelope on a connection, encrypted once the session is up.
    *
-   * Writes are allowed before the handshake completes (the HELLO itself is sent
-   * as soon as the socket is created, and Node buffers it until the connection
-   * is established). Higher-level sends still go through `sendTo`, which can
-   * only resolve a peer that has already completed the handshake.
+   * Writes are allowed before the handshake completes (the HELLO itself is
+   * sent as soon as the socket is created, and Node buffers it until the
+   * connection is established). Higher-level sends still go through `sendTo`,
+   * which can only resolve a peer that has already completed the handshake.
    */
   #write(connection: Connection, envelope: Envelope): boolean {
     if (connection.closed) {
@@ -561,8 +733,20 @@ export class TcpTransport {
     }
 
     const frame = encodeFrame(envelope);
+    let wire: Buffer;
+    if (connection.handshake.phase === 'established') {
+      try {
+        wire = encodeSecureFrame(connection.handshake.session, frame);
+      } catch {
+        this.#destroy(connection, 'error');
+        return false;
+      }
+    } else {
+      wire = encodeHandshakeFrame(frame);
+    }
+
     try {
-      connection.socket.write(frame, error => {
+      connection.socket.write(wire, error => {
         if (error !== null && error !== undefined) {
           this.#destroy(connection, 'error');
         }
@@ -573,7 +757,6 @@ export class TcpTransport {
       return false;
     }
   }
-
 
   #destroy(connection: Connection, reason: PeerGoneReason): void {
     connection.reason = reason;
@@ -605,7 +788,9 @@ export class TcpTransport {
         new Error(
           reason === 'duplicate'
             ? 'a duplicate connection was already established'
-            : `connection failed (${reason})`,
+            : reason === 'tofu-mismatch'
+              ? 'peer identity key changed (possible impostor)'
+              : `connection failed (${reason})`,
         ),
       );
     }
@@ -623,7 +808,7 @@ export class TcpTransport {
           continue;
         }
 
-        if (connection.peer === null) {
+        if (connection.handshake.phase !== 'established') {
           if (now > connection.helloDeadline) {
             this.#destroy(connection, 'hello-timeout');
           }

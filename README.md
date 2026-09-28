@@ -122,10 +122,12 @@ There is no server and no broker of any kind. Each `zapchat` instance:
 3. it listens for other beacons, which is how it learns who exists, what rooms
    they are advertising and which TCP port to reach them on;
 4. it opens a direct TCP connection to each peer (the client with the
-   lexicographically smaller id dials, so two links never fight), sends `HELLO`
-   to identify itself, and then exchanges newline-delimited JSON envelopes:
-   `HELLO`, `ANNOUNCE`, `ROOM_LIST`, `PEER_LIST`, `JOIN`, `LEAVE`, `MESSAGE`,
-   `PING`, `PONG`;
+   lexicographically smaller id dials, so two links never fight), and the two
+   run an encrypted handshake: both sides exchange HELLO frames carrying a
+   signed ephemeral X25519 key exchange, derive one-use AES-256-GCM session
+   keys, and then exchange sealed, sequence-numbered frames containing the JSON
+   envelopes `HELLO`, `ANNOUNCE`, `ROOM_LIST`, `PEER_LIST`, `JOIN`, `LEAVE`,
+   `MESSAGE`, `PING`, `PONG`;
 5. messages are delivered to connected peers in the same room, with a
    duplicate-suppressing relay so a message still lands if one peer is not
    directly reachable from another. Every message carries a unique id, and
@@ -174,11 +176,15 @@ is the port this instance is listening on.
   - macOS: `~/Library/Application Support/zapchat/config.json`
   - Linux/BSD: `$XDG_CONFIG_HOME/zapchat/config.json` or `~/.config/zapchat/config.json`
   - anywhere: whatever `ZAPCHAT_CONFIG_DIR` points at
-- **No encryption in v1 — be honest about it.** Messages travel as plain text
-  over your local network and anyone who can see that traffic can read them.
-  Nothing is claimed to be "end to end encrypted". The networking layer is
-  deliberately split into a transport and a protocol layer so that encryption
-  can be added later without redesigning either.
+- **Encrypted transport (protocol v2).** Every TCP link runs an ephemeral
+  X25519 key exchange; all traffic after the handshake is sealed with
+  AES-256-GCM and sequence-numbered so tampering, replay and frame dropping are
+  detectable and the connection is dropped. Each install has a long-term
+  Ed25519 identity key that signs its handshakes; the first key seen for a peer
+  is pinned (TOFU) and a changed key is refused loudly. Keys are derived with
+  HKDF and live only for the connection (forward secrecy). This protects
+  traffic on your LAN — it is still not anonymous and not a replacement for
+  Signal: there is no central authority verifying who anybody "really" is.
 - **Internet-free chatting.** With the network cable pulled out but the LAN
   intact, everything still works.
 
@@ -318,9 +324,13 @@ than mocks:
   directions, renaming without replaying commands as chat, and reconnecting
   after one is restarted.
 
-## Limitations (v1, stated plainly)
+## Limitations (v2, stated plainly)
 
-- **No encryption.** Plaintext on the LAN, as described above.
+- **Encrypted, but not anonymous or centrally verified.** The v2 protocol
+  encrypts every TCP link and detects impostors via TOFU key pinning, but the
+  first connection to a new peer is still trust-on-first-use: a man-in-the-middle
+  present at *first* contact is not detectable. No certificate authority, no
+  QR-code verification, no safety numbers.
 - **No history.** Chat history is in memory for the session only; quit and it is
   gone. There is no persistence to disk yet.
 - **One room at a time** per instance. You can move between rooms, but you are

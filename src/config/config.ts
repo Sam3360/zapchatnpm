@@ -11,11 +11,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DEFAULT_ROOM, MAX_USERNAME_LENGTH } from '../protocol/constants.js';
+import { generatePrivateKey, identityPublicFromSeed, publicKeyId } from '../protocol/crypto.js';
 import { sanitizeRoomName, sanitizeUsername } from '../protocol/sanitize.js';
 import { createClientId, defaultUsername } from './identity.js';
 import { resolveConfigPath, type PathEnvironment } from './paths.js';
 
 export const CONFIG_VERSION = 1;
+
+/** A pinned peer public key (TOFU), persisted so it survives restarts. */
+export interface PeerPin {
+  keyId: string;
+  seenAt: number;
+}
 
 export interface Config {
   version: number;
@@ -23,6 +30,10 @@ export interface Config {
   /** Empty string means "ask the user on first launch". */
   username: string;
   lastRoom: string;
+  /** Base64 of our long-term X25519 identity private key (protocol v2). */
+  identityKey: string;
+  /** Peer public-key pins for TOFU checking, keyed by client id. */
+  peerPins: Record<string, PeerPin>;
   createdAt: number;
   updatedAt: number;
 }
@@ -54,9 +65,40 @@ function buildDefaultConfig(now: number, username = ''): Config {
     clientId: createClientId(),
     username,
     lastRoom: DEFAULT_ROOM,
+    identityKey: generateIdentityKey(),
+    peerPins: {},
     createdAt: now,
     updatedAt: now,
   };
+}
+
+/** Generate a new long-term identity seed (Ed25519, stored base64 in the config). */
+function generateIdentityKey(): string {
+  return generatePrivateKey().toString('base64');
+}
+
+/** True when `value` decodes to a usable 32-byte Ed25519 identity seed. */
+function isValidIdentityKey(value: string): boolean {
+  if (value.length === 0 || value.length > 64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return false;
+  }
+
+  try {
+    identityPublicFromSeed(Buffer.from(value, 'base64'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Our long-term identity public key, derived from the stored seed. */
+export function identityPublicKey(config: Config): Buffer {
+  return identityPublicFromSeed(Buffer.from(config.identityKey, 'base64'));
+}
+
+/** Fingerprint of our long-term identity public key (for /status display). */
+export function identityKeyId(config: Config): string {
+  return publicKeyId(identityPublicKey(config));
 }
 
 /**
@@ -92,6 +134,36 @@ function normaliseConfig(raw: unknown, now: number): { config: Config; warning?:
     lastRoom = sanitizeRoomName(source['lastRoom']) ?? DEFAULT_ROOM;
   }
 
+  let identityKey = typeof source['identityKey'] === 'string' ? source['identityKey'] : '';
+  if (!isValidIdentityKey(identityKey)) {
+    if (identityKey !== '') {
+      notes.push('regenerated unusable identity key');
+    }
+
+    identityKey = generateIdentityKey();
+  }
+
+  const peerPins: Record<string, PeerPin> = {};
+  const rawPins = source['peerPins'];
+  if (typeof rawPins === 'object' && rawPins !== null && !Array.isArray(rawPins)) {
+    for (const [id, pin] of Object.entries(rawPins as Record<string, unknown>)) {
+      if (id.length === 0 || id.length > 64 || typeof pin !== 'object' || pin === null) {
+        continue;
+      }
+
+      const record = pin as Record<string, unknown>;
+      if (
+        typeof record['keyId'] === 'string' &&
+        record['keyId'].length > 0 &&
+        record['keyId'].length <= 64 &&
+        typeof record['seenAt'] === 'number' &&
+        Number.isFinite(record['seenAt'])
+      ) {
+        peerPins[id] = { keyId: record['keyId'], seenAt: record['seenAt'] };
+      }
+    }
+  }
+
   const createdAt =
     typeof source['createdAt'] === 'number' && Number.isFinite(source['createdAt'])
       ? source['createdAt']
@@ -103,6 +175,8 @@ function normaliseConfig(raw: unknown, now: number): { config: Config; warning?:
       clientId: clientId ?? createClientId(),
       username,
       lastRoom,
+      identityKey,
+      peerPins,
       createdAt,
       updatedAt: now,
     },

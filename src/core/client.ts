@@ -43,6 +43,7 @@ import { loadConfig, saveConfigTo, type Config, type LoadConfigOptions } from '.
 import { createClientId, defaultUsername } from '../config/identity.js';
 import { DiscoveryService, type DiscoveryKind, type DiscoveryState } from '../discovery/discovery.js';
 import { TcpTransport, type PeerGoneReason, type PeerHandle } from '../network/transport.js';
+import { PeerPinStore } from '../protocol/handshake.js';
 import { describeNetwork, localAddresses } from '../network/interfaces.js';
 import {
   RoomRegistry,
@@ -141,6 +142,8 @@ export class ZapClient {
   #username: string;
   #usernameConfirmed: boolean;
   #registry: RoomRegistry;
+  /** TOFU pin store for peer identity keys (protocol v2). */
+  #pinStore: PeerPinStore;
 
   #discovery: DiscoveryService | null = null;
   #transport: TcpTransport | null = null;
@@ -167,6 +170,7 @@ export class ZapClient {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#log = options.log ?? (() => {});
+    this.#pinStore = new PeerPinStore();
 
     const loaded = loadConfig({
       ...(options.configOptions ?? {}),
@@ -177,6 +181,7 @@ export class ZapClient {
     this.#config = loaded.config;
     this.#configPath = loaded.path;
     this.#clientId = options.clientId ?? loaded.config.clientId;
+    this.#pinStore.seed(loaded.config.peerPins);
 
     if (loaded.warning !== undefined) {
       this.#addWarning(loaded.warning);
@@ -272,6 +277,18 @@ export class ZapClient {
       },
       {
         clientId: this.#clientId,
+        identitySeed: Buffer.from(this.#config.identityKey, 'base64'),
+        checkPeerPin: (clientId, identityKeyId) => {
+          const verdict = this.#pinStore.check(clientId, identityKeyId, this.#now());
+          if (verdict === 'new') {
+            // First contact with this peer: persist the pin immediately so it
+            // is already on disk before the next encounter.
+            this.#config = { ...this.#config, peerPins: this.#pinStore.toConfig() };
+            this.#writeConfig();
+          }
+
+          return verdict;
+        },
         now: this.#now,
       },
     );

@@ -7,8 +7,33 @@
  * exhausting memory.
  */
 
-/** Wire protocol version. Peers with a different version refuse to talk. */
-export const PROTOCOL_VERSION = 1;
+/**
+ * Wire protocol version. Peers with a different version refuse to talk.
+ *
+ * v2 hardens the TCP mesh: every connection runs an ephemeral X25519 key
+ * exchange and all data frames are sealed with AES-256-GCM (see
+ * `protocol/crypto.ts`, `protocol/secureFraming.ts`, `protocol/handshake.ts`).
+ * There is no fallback to v1 — a v1 peer is refused with an upgrade notice.
+ */
+export const PROTOCOL_VERSION = 2;
+
+/** First byte of every v2 TCP frame; a v1 peer never emits it. */
+export const MAGIC_BYTE = 0xc2;
+
+/** v2 TCP frame header: magic(1) + sequence(8) + payload length(4). */
+export const HEADER_BYTES = 13;
+
+/** Largest v2 TCP frame payload we will accept (sealed envelope room + headroom). */
+export const MAX_SECURE_PAYLOAD_BYTES = 16 * 1024;
+
+/** Upper bound on v2 sequence numbers (JSON-safe, far beyond any session). */
+export const MAX_SEQ = 2 ** 53 - 1;
+
+/** Length of an X25519 public key on the wire. */
+export const PUBLIC_KEY_BYTES = 32;
+
+/** Seconds a peer's TOFU key pin stays trusted after its last sighting. */
+export const PEER_PIN_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 
 /** UDP port used for discovery beacons (multicast + broadcast). */
 export const DEFAULT_DISCOVERY_PORT = 45912;
@@ -27,6 +52,9 @@ export const MAX_UDP_PACKET_BYTES = 1100;
 
 /** Largest single TCP frame (one JSON envelope) we will accept. */
 export const MAX_FRAME_BYTES = 8 * 1024;
+
+/** Bytes of entropy in a handshake freshness nonce. */
+export const HANDSHAKE_NONCE_BYTES = 32;
 
 /** Largest chat message body, in Unicode code points. */
 export const MAX_MESSAGE_CHARS = 1000;
