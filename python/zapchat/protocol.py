@@ -13,6 +13,12 @@ import uuid
 
 PROTOCOL_VERSION = 1
 
+# CTCP-style action framing (`/me waves` -> 0x01 ACTION waves 0x01), matching
+# the npm client: no protocol change, v1-only peers render it as plain text.
+ACTION_BYTE = "\x01"
+_ACTION_PREFIX = ACTION_BYTE + "ACTION "
+_ACTION_SUFFIX = ACTION_BYTE
+
 # The npm client uses these limits; stay compatible.
 MAX_MESSAGE_CHARS = 1000
 MAX_USERNAME_LENGTH = 20
@@ -171,6 +177,36 @@ def parse_envelope(raw, clock_skew_check=True):
     }
 
 
+def is_action_message(text):
+    """True when `text` is a framed action message (0x01 ACTION ... 0x01)."""
+    return (
+        isinstance(text, str)
+        and text.startswith(_ACTION_PREFIX)
+        and text.endswith(_ACTION_SUFFIX)
+        and len(text) > len(_ACTION_PREFIX)
+    )
+
+
+def encode_action_message(text):
+    """Frame a user's action text for the wire; None when empty after trimming."""
+    if not isinstance(text, str):
+        return None
+    body = text.strip()
+    if not body:
+        return None
+    return _ACTION_PREFIX + body + _ACTION_SUFFIX
+
+
+def action_body(text):
+    """Extract the action body (`waves hello`) from a framed message."""
+    return text[len(_ACTION_PREFIX) : len(text) - len(_ACTION_SUFFIX)]
+
+
+def render_action(username, text):
+    """Render an action for display: the sender becomes the verb's subject."""
+    return "* " + username + " " + action_body(text)
+
+
 def parse_message_data(data):
     """Validate a MESSAGE payload; return the text or None."""
     if not isinstance(data, dict):
@@ -180,6 +216,16 @@ def parse_message_data(data):
         return None
     if len(text) > MAX_MESSAGE_CHARS * 4:
         return None
+
+    # CTCP action framing must be checked BEFORE control-character stripping:
+    # the 0x01 markers would otherwise be destroyed for legitimate actions.
+    # The body between the markers is sanitised normally.
+    if is_action_message(text):
+        body = sanitize_text(action_body(text), MAX_MESSAGE_CHARS)
+        if not body:
+            return None
+        return _ACTION_PREFIX + body + _ACTION_SUFFIX
+
     cleaned = CONTROL_CHARS.sub("", ANSI_SEQUENCES.sub("", text)).strip()[:MAX_MESSAGE_CHARS]
     return cleaned or None
 

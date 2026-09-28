@@ -27,6 +27,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'create', args: '<room>', summary: 'create a room and join it' },
   { name: 'leave', summary: 'leave the current room, back to the lobby' },
   { name: 'clear', summary: 'clear the local message view for this room' },
+  { name: 'me', args: '<action>', summary: 'do something, e.g. /me waves hello' },
   { name: 'name', args: '<username>', summary: 'change your display name', aliases: ['nick'] },
   {
     name: 'connect',

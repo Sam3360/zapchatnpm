@@ -31,6 +31,8 @@ import {
   type Envelope,
   type PeerContact,
 } from '../protocol/messages.js';
+import { encodeActionMessage, isActionMessage, renderAction } from '../protocol/actions.js';
+import { RateLimiter } from '../protocol/ratelimit.js';
 import {
   charLength,
   isValidHost,
@@ -161,6 +163,8 @@ export class ZapClient {
   #warnings: string[] = [];
 
   readonly #advertisedRooms = new Set<string>();
+  /** Per-peer flood guard for MESSAGE frames (v4). */
+  readonly #messageLimiter = new RateLimiter();
   readonly #attempts = new Map<string, AttemptState>();
   /** Peers we have shown a "reconnecting" notice for. */
   readonly #reconnecting = new Set<string>();
@@ -474,6 +478,41 @@ export class ZapClient {
       data: { text: body },
       ts: this.#now(),
     });
+
+    return this.#sendMessageEnvelope(envelope, room, body);
+  }
+
+  /** Send a `/me` action, rendered as "* yourname waves" on every peer. */
+  sendAction(text: string): ActionResult {
+    const room = this.#registry.selfRoom;
+    if (room === null) {
+      return this.#fail('join a room first (/join general)');
+    }
+
+    const framed = encodeActionMessage(text);
+    if (framed === null) {
+      return this.#fail('action is empty');
+    }
+
+    // Re-check the length against the *framed* payload so actions obey the
+    // same wire limit as ordinary messages.
+    if (charLength(framed) > 4000) {
+      return this.#fail('message is too long');
+    }
+
+    const envelope = createEnvelope('MESSAGE', this.#identity(), {
+      room,
+      data: { text: framed },
+      ts: this.#now(),
+    });
+
+    // The local echo is the rendered form ("* alice waves"); the wire payload
+    // stays the framed text. #sendMessageEnvelope records the message, sends,
+    // and shows the no-peers notice when needed.
+    return this.#sendMessageEnvelope(envelope, room, renderAction(this.#username, framed));
+  }
+
+  #sendMessageEnvelope(envelope: Envelope, room: string, body: string): ActionResult {
 
     // Mark our own id as seen so a relayed echo is ignored.
     this.#registry.markSeen(envelope.id, this.#now());
@@ -825,6 +864,12 @@ export class ZapClient {
           return;
         }
 
+        // Flood guard: a hostile peer spraying messages gets dropped on the
+        // floor once its bucket is empty (normal chat never comes close).
+        if (!this.#messageLimiter.allow(envelope.from)) {
+          return;
+        }
+
         if (!this.#registry.markSeen(envelope.id, now)) {
           // Already delivered (relayed by another peer): drop silently.
           return;
@@ -837,7 +882,10 @@ export class ZapClient {
             id: envelope.id,
             room: envelope.room,
             kind: 'chat',
-            text: data.text,
+            // /me actions arrive framed (0x01 ACTION ... 0x01); render them.
+            text: isActionMessage(data.text)
+              ? renderAction(envelope.username, data.text)
+              : data.text,
             from: envelope.from,
             username: envelope.username,
             ts: envelope.ts,

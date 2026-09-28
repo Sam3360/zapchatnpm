@@ -85,6 +85,20 @@ export function runCommand(parsed: ParsedCommand, context: CommandContext): Comm
       return 'handled';
     }
 
+    case 'me': {
+      if (parsed.args.length === 0) {
+        print('usage: /me <action>   e.g. /me waves hello', 'warn');
+        return 'handled';
+      }
+
+      const result = client.sendAction(parsed.args);
+      if (!result.ok && result.error !== undefined) {
+        print(result.error, 'warn');
+      }
+
+      return 'handled';
+    }
+
     case 'connect': {
       if (parsed.args.length === 0) {
         print('usage: /connect <host[:port]>   e.g. /connect 192.168.1.24', 'warn');

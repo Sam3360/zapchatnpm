@@ -16,6 +16,8 @@ from .client import ChatClient
 from .discovery import DiscoveryService, DISCOVERY_PORT
 from .protocol import (
     MAX_USERNAME_LENGTH,
+    is_action_message,
+    render_action,
     sanitize_room_name,
     sanitize_username,
 )
@@ -93,12 +95,13 @@ def load_or_create_config(name_override=None):
 class ChatApp:
     """Wires discovery + the TCP client together and runs the chat loop."""
 
-    def __init__(self, username, room, client_id, no_discovery=False, connect_to=None):
+    def __init__(self, username, room, client_id, no_discovery=False, connect_to=None, tcp_port=45913):
         self.username = username
         self.room = room
         self.client_id = client_id
         self.no_discovery = no_discovery
         self.connect_to = connect_to
+        self.tcp_port = tcp_port
 
         self.history = []  # rendered lines kept for /help-style local commands
         self.lock = threading.Lock()
@@ -129,7 +132,12 @@ class ChatApp:
             ts = kwargs.get("ts")
             seconds = (ts / 1000) if isinstance(ts, (int, float)) and ts > 10_000_000_000 else time.time()
             stamp = time.strftime("%H:%M", time.localtime(seconds))
-            self._print(f"{stamp} {kwargs['sender']}: {kwargs['text']}")
+            text = kwargs["text"]
+            if is_action_message(text):
+                # `/me waves` arrives framed; render it as `* sam waves`.
+                self._print(f"{stamp} {render_action(kwargs['sender'], text)}")
+            else:
+                self._print(f"{stamp} {kwargs['sender']}: {text}")
         elif kind == "peer-connected":
             self._print(f"* {kwargs['username']} connected")
         elif kind == "peer-gone":
@@ -145,7 +153,7 @@ class ChatApp:
     # ------------------------------------------------------------------- start
 
     def start(self):
-        port = self.chat.start()
+        port = self.chat.start(port_base=self.tcp_port)
         if self.discovery is not None:
             self.discovery.tcp_port = port
             self.discovery.start()
@@ -218,7 +226,7 @@ class ChatApp:
 
         if command in ("help", "h", "?"):
             self._print(
-                "commands: /rooms /users /join <room> /name <username> "
+                "commands: /rooms /users /me <action> /join <room> /name <username> "
                 "/connect <ip[:port]> /status /quit"
             )
         elif command == "rooms":
@@ -264,7 +272,15 @@ class ChatApp:
                 args=(address, int(port_text or 45913)),
                 daemon=True,
             ).start()
-        elif command == "status":
+        elif command == "me":
+            if not argument:
+                self._print("! usage: /me <action>")
+                return
+            if not self.chat.peer_ids:
+                self._print("! nobody is connected yet; waiting for the network...")
+                return
+            self.chat.send_action(argument)
+            self._print(f"* {self.username} {argument.strip()}")
             discovery = self.discovery
             if discovery is None:
                 self._print("  discovery: off")
@@ -308,6 +324,7 @@ def main(argv=None):
         client_id=config["clientId"],
         no_discovery=args.no_discovery,
         connect_to=args.connect,
+        tcp_port=args.tcp_port,
     )
 
     app.start()

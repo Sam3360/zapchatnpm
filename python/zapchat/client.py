@@ -12,9 +12,11 @@ import threading
 from .protocol import (
     create_envelope,
     decode_frames,
+    encode_action_message,
     encode_envelope,
     now_ms,
     parse_envelope,
+    parse_message_data,
     sanitize_room_name,
 )
 
@@ -167,6 +169,17 @@ class ChatClient:
         self.on_event("message-sent", envelope=envelope, peers=sent)
         return sent
 
+    def send_action(self, text):
+        """Send an action (`/me waves`) to every connected peer in the room."""
+        framed = encode_action_message(text)
+        if framed is None:
+            return 0
+        room = self.get_room()
+        envelope = create_envelope("MESSAGE", self.client_id, self.username, room=room, data={"text": framed})
+        sent = self._broadcast(envelope, room)
+        self.on_event("message-sent", envelope=envelope, peers=sent)
+        return sent
+
     def send_heartbeat(self):
         self._broadcast(create_envelope("PING", self.client_id, self.username), None)
 
@@ -272,7 +285,9 @@ class ChatClient:
             return
 
         if msg_type == "MESSAGE":
-            text = envelope["data"].get("text") if isinstance(envelope["data"], dict) else None
+            # parse_message_data strips hostile control/ANSI bytes and keeps
+            # CTCP action framing intact (it re-sanitises only the body).
+            text = parse_message_data(envelope["data"]) if isinstance(envelope["data"], dict) else None
             if text:
                 self.on_event(
                     "message",

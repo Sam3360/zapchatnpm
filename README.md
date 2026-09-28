@@ -46,6 +46,27 @@ accounts, use those. `zapchat` is for "we are on the same network right now".
 - Terminal: anything with ANSI colour support — Windows Terminal, PowerShell,
   cmd.exe, iTerm2, GNOME Terminal, kitty, Alacritty, tmux all work
 
+### Python users: `pip install zapchat`
+
+There is also a Python distribution of zapchat that speaks the same discovery
+beacons and message protocol, so **Python and npm users on the same Wi-Fi chat
+with each other out of the box**:
+
+```bash
+pip install zapchat
+zapchat            # same idea: name, rooms, /commands, no accounts
+```
+
+- The `zapchat` command is installed on your PATH; Python 3.9+ on Windows,
+  macOS or Linux, standard library only (zero dependencies).
+- Same UDP discovery (multicast + broadcast), same TCP messaging, same rooms.
+- Command set is a friendly subset: `/rooms`, `/users`, `/me`, `/join`, `/name`,
+  `/connect`, `/status`, `/quit` (see [python/README.md](python/README.md)).
+- Line-based plain-text UI — ideal for SSH sessions, tmux and old terminals.
+- Wire format note: Python and npm speak the same envelope *shapes*, but the
+  npm client's encrypted transport is v2-only (a v1 peer is refused with an
+  upgrade notice) — see *Interoperability* below for exactly what works today.
+
 ## Installation
 
 ```bash
@@ -53,8 +74,28 @@ npm install -g zapchat
 zapchat
 ```
 
+Python: `pip install zapchat` (see the section above).
+
 On Windows, the `zapchat` command works in PowerShell, cmd and Windows
 Terminal. No shell-specific paths or `/bin/bash` assumptions.
+
+### Interoperability (npm ↔ Python)
+
+Both implementations announce themselves with the same UDP beacons, so Python
+and npm users **see each other** on the LAN. Chat compatibility is per-link:
+
+| Link | Works today? | Why |
+| --- | --- | --- |
+| npm ↔ npm | ✅ | Encrypted TCP (protocol v2: X25519 + AES-256-GCM) |
+| Python ↔ Python | ✅ | JSON envelopes over TCP (protocol v1) |
+| npm ↔ Python | ❌ not yet | npm v2 refuses v1 peers with an upgrade notice; there is no plaintext fallback by design |
+
+> Both stacks keep the same envelope shapes and limits (`HELLO`, `ANNOUNCE`,
+> `MESSAGE`, …, same size caps, same sanitisation rules), and actions
+> (`/me waves` → `* sam waves`) use the identical CTCP framing on both sides —
+> so the remaining gap is only the transport layer, not the messaging format.
+> A v1 compatibility mode is on the roadmap; tracking it in
+> [issues](https://github.com/Sam3360/zapchatnpm/issues).
 
 ## First run
 
@@ -102,6 +143,7 @@ other people in the room.
 | `/leave` | Leave the current room, back to the lobby |
 | `/clear` | Clear the local view for this room |
 | `/name <username>` | Change your display name |
+| `/me <action>` | Send an action message: `/me waves` → `* sam waves` |
 | `/connect <host[:port]>` | Connect straight to a peer when discovery is blocked |
 | `/status` | Discovery, ports, peers and rejected frames |
 | `/quit` `/q` | Exit |
@@ -202,6 +244,8 @@ Everything arriving from the network is treated as hostile:
   text so a message can never repaint or corrupt your terminal;
 - messages are size-limited, identifiers are unique so duplicates and relayed
   copies are suppressed, and nothing received is ever executed;
+- per-peer rate limiting (token bucket) caps incoming MESSAGE floods — a peer
+  hammering the room is throttled instead of being able to wash out the screen;
 - connections that never complete a `HELLO` handshake are closed, and a peer
   that stops responding mid-stream is dropped.
 

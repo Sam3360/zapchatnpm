@@ -12,6 +12,11 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  ACTION_BYTE,
+  actionBody,
+  isActionMessage,
+} from './actions.js';
+import {
   MAX_ADDRESSES,
   MAX_CLOCK_SKEW_MS,
   MAX_MESSAGE_CHARS,
@@ -321,6 +326,14 @@ export function parseMessageData(data: unknown): MessageData | null {
   // Reject absurd payloads before doing any work on them.
   if (charLength(raw) > MAX_MESSAGE_CHARS * 4) {
     return null;
+  }
+
+  // CTCP-style action framing (0x01 ACTION ... 0x01) must be checked BEFORE
+  // sanitising: the control-byte strip would otherwise destroy the framing of
+  // legitimate actions. The body between the markers is sanitised normally.
+  if (isActionMessage(raw)) {
+    const body = sanitizeMessageText(actionBody(raw));
+    return body.length === 0 ? null : { text: `${ACTION_BYTE}ACTION ${body}${ACTION_BYTE}` };
   }
 
   const text = sanitizeMessageText(raw);

@@ -8,9 +8,12 @@ It speaks the same discovery protocol as the Node.js version, so a Python user
 and an npm user on the same Wi-Fi can chat with each other.
 
 > The Python client runs the proven protocol v1 wire format (JSON envelopes
-> over TCP, signed discovery beacons). The Node.js client's protocol v2 adds
-> TLS-style encryption on top of the same envelope shapes — the Python client
-> interoperates with npm peers via the shared discovery and messaging format.
+> over TCP, discovery beacons). The Node.js client's protocol v2 adds
+> TLS-style encryption on top of the same envelope shapes — so Python and npm
+> users **see each other** on the LAN via the shared discovery, and both sides
+> use identical message formats, but npm v2 currently refuses v1 chat links
+> (no plaintext fallback by design). npm ↔ npm and Python ↔ Python chat work
+> today; npm ↔ Python chat is on the roadmap.
 
 ## Install
 
@@ -45,6 +48,7 @@ zapchat 3.0.0 — LAN chat, no accounts, no server
 | `/users` `/who` | Who is on the LAN and connected |
 | `/join <room>` | Join a room (created if nobody is in it) |
 | `/name <username>` | Change your display name |
+| `/me <action>` | Send an action message: `/me waves` → `* sam waves` |
 | `/connect <ip[:port]>` | Connect straight to a peer when discovery is blocked |
 | `/status` | Discovery state, ports, peers |
 | `/quit` | Exit |
@@ -59,7 +63,8 @@ zapchat 3.0.0 — LAN chat, no accounts, no server
 - There is no server of any kind. If the LAN works, zapchat works.
 
 Works with the npm version of zapchat on the same network (same beacons, same
-message protocol).
+message protocol). Actions (`/me`) use the same CTCP-style framing as the npm
+client, so an npm user sees `* sam waves` exactly like a Python user does.
 
 ## Privacy
 
