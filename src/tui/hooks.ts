@@ -16,6 +16,7 @@ import {
   type EditorState,
   type KeyDescriptor,
 } from './input/lineEditor.js';
+import { completeInput, type CompletionContext, type CompletionState } from './completion.js';
 
 /** Subscribe to the client's snapshot. Re-renders on every change. */
 export function useZapSnapshot(client: ZapClient): Snapshot {
@@ -38,6 +39,13 @@ export interface LineEditor {
    */
   handleKey: (key: KeyDescriptor) => EditorAction;
   /**
+   * Apply one Tab press against the completion candidates for the current
+   * snapshot (members, rooms). Returns the completed text, or null when
+   * nothing matched (the text is left alone). Repeated Tabs without an edit
+   * rotate through the matches; any other edit restarts the rotation.
+   */
+  completeTab: (candidates: CompletionContext) => string | null;
+  /**
    * Read the current text/cursor. Unlike `state` this is always fresh, even for
    * keystrokes handled earlier in the same tick (paste, Enter after typing).
    */
@@ -53,6 +61,9 @@ export function useLineEditor(): LineEditor {
   const [state, setState] = useState<EditorState>(EMPTY_EDITOR);
   const historyRef = useRef<string[]>([]);
   const indexRef = useRef<number | null>(null);
+  // Tab rotation state: persists across Tab presses, resets on any edit.
+  const completionRef = useRef<CompletionState>({ matchIndex: 0 });
+  const completionTextRef = useRef<string>(EMPTY_EDITOR.text);
 
   const commit = useCallback((next: EditorState) => {
     stateRef.current = next;
@@ -62,6 +73,11 @@ export function useLineEditor(): LineEditor {
   const setText = useCallback(
     (text: string) => {
       indexRef.current = null;
+      // A hand edit (not a Tab) restarts completion rotation.
+      if (text !== completionTextRef.current) {
+        completionRef.current = { matchIndex: 0 };
+        completionTextRef.current = text;
+      }
       commit(replaceText(text));
     },
     [commit],
@@ -69,6 +85,8 @@ export function useLineEditor(): LineEditor {
 
   const reset = useCallback(() => {
     indexRef.current = null;
+    completionRef.current = { matchIndex: 0 };
+    completionTextRef.current = EMPTY_EDITOR.text;
     commit(EMPTY_EDITOR);
   }, [commit]);
 
@@ -115,16 +133,42 @@ export function useLineEditor(): LineEditor {
         return 'next';
       }
 
-      if (
-        result.action === 'submit' ||
-        result.action === 'cancel' ||
-        result.action === 'tab'
-      ) {
+      if (result.action === 'submit' || result.action === 'cancel') {
         return result.action;
+      }
+
+      if (result.action === 'tab') {
+        // The screen completes the word (it knows the candidates); the editor
+        // just leaves the raw text alone here.
+        return 'tab';
+      }
+
+      // Any real keystroke restarts Tab rotation.
+      if (result.state.text !== completionTextRef.current) {
+        completionRef.current = { matchIndex: 0 };
+        completionTextRef.current = result.state.text;
       }
 
       commit(result.state);
       return 'none';
+    },
+    [commit],
+  );
+
+  const completeTab = useCallback(
+    (candidates: CompletionContext): string | null => {
+      const current = stateRef.current.text;
+      const result = completeInput(current, candidates, completionRef.current);
+      // Every press advances the rotation — including a press that produced
+      // no visible change (an exact typed word is a no-op first, then cycles).
+      completionRef.current.matchIndex += 1;
+      if (result.matches.length === 0 || result.text === current) {
+        return null;
+      }
+
+      completionTextRef.current = result.text;
+      commit(replaceText(result.text));
+      return result.text;
     },
     [commit],
   );
@@ -135,6 +179,7 @@ export function useLineEditor(): LineEditor {
     state,
     isEmpty: state.text.length === 0,
     handleKey,
+    completeTab,
     read,
     setText,
     reset,

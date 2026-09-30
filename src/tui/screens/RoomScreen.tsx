@@ -112,6 +112,16 @@ export function RoomScreen({
       }
 
       leaveRoom();
+      return;
+    }
+
+    if (action === 'tab') {
+      // Complete the word before the cursor: /commands, room names for
+      // /join//create, member usernames everywhere else.
+      editor.completeTab({
+        members: snapshot.members.map(member => member.username),
+        rooms: snapshot.rooms.map(entry => entry.name),
+      });
     }
   });
 
