@@ -65,6 +65,8 @@ zapchat            # same idea: name, rooms, /commands, no accounts
 - Command set is a friendly subset: `/rooms`, `/users`, `/me`, `/join`, `/name`,
   `/connect`, `/status`, `/quit` (see [python/README.md](python/README.md)).
 - Line-based plain-text UI — ideal for SSH sessions, tmux and old terminals.
+- Tab completion (since v7): `/jo<Tab>` completes commands, `@na<Tab>`
+  completes room members, `#ge<Tab>` completes rooms — on both stacks.
 - Wire format note: since v6 the Python client speaks wire protocol v2
   natively (X25519 + AES-256-GCM, same as npm) — see *Interoperability* below.
 

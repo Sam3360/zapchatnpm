@@ -21,6 +21,7 @@ import {
   DEFAULT_MULTICAST_ADDRESS,
   DEFAULT_WIRE_VERSION,
   MAX_UDP_PACKET_BYTES,
+  PEER_STALE_MS,
   SUPPORTED_WIRE_VERSIONS,
 } from '../protocol/constants.js';
 import {
@@ -102,6 +103,10 @@ export class DiscoveryService {
   #timer: NodeJS.Timeout | null = null;
   #closed = false;
   #warnedAboutDuplicateId = false;
+  /** client id -> [ip, udp port] for direct unicast beacons (reliable path). */
+  readonly #peerEndpoints = new Map<string, [string, number]>();
+  /** client id -> last time we heard from them (prunes unicast targets). */
+  readonly #lastSeenByPeer = new Map<string, number>();
 
   #state: DiscoveryState;
 
@@ -256,9 +261,64 @@ export class DiscoveryService {
       return;
     }
 
-    this.#timer = setInterval(() => this.announceNow(), this.#intervalMs);
+    this.#timer = setInterval(() => {
+      this.announceNow();
+      this.#announceUnicast();
+    }, this.#intervalMs);
     // Beacons must never keep the process alive on their own.
     this.#timer.unref?.();
+  }
+
+  /**
+   * Unicast a beacon straight to every known peer's UDP source endpoint.
+   *
+   * Multicast and broadcast are best-effort; this is the reliable path that
+   * keeps discovery converging even when multicast packets get lost. Both
+   * wire versions are sent so the peer's classification never depends on
+   * which single multicast packet happened to arrive.
+   */
+  #announceUnicast(): void {
+    const socket = this.#socket;
+    if (socket === null || this.#closed || !this.#state.listening) {
+      return;
+    }
+
+    const snapshot = this.#options.getAnnounce();
+    const announceData = {
+      port: snapshot.port,
+      addresses: localAddresses(this.#interfaces()),
+      rooms: [snapshot.room, ...snapshot.rooms].filter(
+        (room): room is string => typeof room === 'string',
+      ),
+    };
+
+    const now = this.#now();
+    for (const [clientId, endpoint] of [...this.#peerEndpoints.entries()]) {
+      const lastSeen = this.#lastSeenByPeer.get(clientId) ?? 0;
+      if (now - lastSeen > PEER_STALE_MS) {
+        this.#peerEndpoints.delete(clientId);
+        this.#lastSeenByPeer.delete(clientId);
+        continue;
+      }
+
+      for (const version of SUPPORTED_WIRE_VERSIONS) {
+        const packet = buildBeacon(
+          { clientId: this.#clientId, username: snapshot.username, room: snapshot.room },
+          announceData,
+          now,
+          version,
+        );
+        if (packet === null) {
+          continue;
+        }
+
+        socket.send(packet, 0, packet.length, endpoint[1], endpoint[0], error => {
+          if (error === null) {
+            this.#state = { ...this.#state, beaconsSent: this.#state.beaconsSent + 1 };
+          }
+        });
+      }
+    }
   }
 
   /** Send a beacon right now (used on startup, room changes and `/rescan`). */
@@ -398,6 +458,13 @@ export class DiscoveryService {
         loopback: remote.address === '127.0.0.1' || remote.address.startsWith('127.'),
       },
     );
+
+    // Remember the beacon's source endpoint: unicast is the reliable path
+    // that keeps the mesh converging when multicast drops packets (on
+    // Windows a multicast-only listener can receive only the FIRST packet
+    // of a back-to-back pair, starving it of one wire version).
+    this.#peerEndpoints.set(envelope.from, [remote.address, remote.port]);
+    this.#lastSeenByPeer.set(envelope.from, this.#now());
   }
 
   stop(): void {

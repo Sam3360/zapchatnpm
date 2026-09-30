@@ -404,9 +404,38 @@ def main(argv=None):
 
     app.start()
 
-    # Standard input is line-buffered; ctrl+c raises KeyboardInterrupt.
+    # Tab completion wherever readline exists (POSIX; optional on Windows).
     try:
-        for line in sys.stdin:
+        import readline
+    except ImportError:
+        readline = None
+
+    if readline is not None:
+        from .completion import TabCompleter
+
+        def _completion_candidates():
+            rooms = list(app.discovery.live_rooms().keys()) if app.discovery else []
+            if app.room and app.room not in rooms:
+                rooms.append(app.room)
+            return {"members": app.chat.peer_usernames(), "rooms": rooms}
+
+        completer = TabCompleter(_completion_candidates)
+        readline.set_completer(completer.complete)
+        # Only whitespace separates words: "/", "@" and "#" stay part of the
+        # word so the completer can see (and preserve) them.
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
+
+    # Standard input is line-buffered; ctrl+c raises KeyboardInterrupt.
+    # input() (not `for line in sys.stdin`) is what activates the readline
+    # hook above in interactive terminals; non-interactive stdin (pipes,
+    # tests) behaves exactly as before.
+    try:
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
             line = line.strip()
             if line:
                 try:

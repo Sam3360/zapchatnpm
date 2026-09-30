@@ -111,5 +111,5 @@ export function helpLines(): string[] {
 export function footerHint(context: 'lobby' | 'room'): string {
   return context === 'lobby'
     ? '↑↓ select · enter join · /help · ctrl+c quit'
-    : 'enter send · ↑↓ scroll · pgup/pgdn page · esc leave · /help';
+    : 'enter send · tab complete · ↑↓ scroll · esc leave · /help';
 }

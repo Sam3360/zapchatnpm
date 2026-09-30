@@ -1024,11 +1024,26 @@ export class ZapClient {
       return;
     }
 
-    // A peer advertising v1 in its beacon is legacy (e.g. the Python client):
-    // dial it in plaintext only when the user opted in via --allow-plaintext;
-    // otherwise leave it alone (a v2 dial against a v1 peer just times out).
+    // A peer advertising v1 only is legacy (e.g. a zapchat ≤ 5 Python
+    // client). Without --allow-plaintext there is nothing to dial: a v2
+    // handshake against a v1 peer just times out in silence. Say so once,
+    // then leave the peer alone until it announces v2 (e.g. after an
+    // upgrade) or the user opts in.
     const legacy = peer.wireVersion === LEGACY_WIRE_VERSION;
-    if (legacy && this.#options.allowPlaintext === true && !this.#legacyWarned.has(peer.clientId)) {
+    if (legacy && this.#options.allowPlaintext !== true) {
+      if (!this.#legacyWarned.has(peer.clientId)) {
+        this.#legacyWarned.add(peer.clientId);
+        this.#log(
+          `${peer.username} runs an older client without encryption (protocol v1); ` +
+            'not linking — start with --allow-plaintext to allow unencrypted links, or ask them to upgrade to zapchat 6+',
+          'warn',
+        );
+      }
+
+      return;
+    }
+
+    if (legacy && !this.#legacyWarned.has(peer.clientId)) {
       this.#legacyWarned.add(peer.clientId);
       this.#log(
         `${peer.username} speaks the legacy protocol; connecting without encryption (plaintext)`,

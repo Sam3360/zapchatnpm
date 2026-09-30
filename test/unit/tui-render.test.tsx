@@ -41,6 +41,7 @@ function fakeEditor(text = '', cursor = text.length): LineEditor {
     state: { text, cursor },
     isEmpty: text.length === 0,
     handleKey: () => 'none',
+    completeTab: () => null,
     read: () => ({ text, cursor }),
     setText: () => {},
     reset: () => {},

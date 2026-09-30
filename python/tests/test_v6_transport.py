@@ -297,3 +297,36 @@ def test_tampered_secure_frame_drops_the_link():
     finally:
         alice.stop()
         bob.stop()
+
+
+def test_beacon_classification_never_downgrades_to_legacy():
+    """v6+ announces in v1 AND v2; arrival order must not re-classify."""
+    from zapchat.discovery import DiscoveryService, Peer
+
+    service = DiscoveryService("clid-self", "self", "general", tcp_port=1)
+    envelope_v2 = {
+        "v": 2,
+        "id": "beacon0001",
+        "type": "ANNOUNCE",
+        "ts": int(time.time() * 1000),
+        "from": "clid-peer",
+        "username": "peer",
+        "room": "general",
+        "data": {"port": 1, "addresses": ["127.0.0.1"], "rooms": ["general"]},
+    }
+    envelope_v1 = {**envelope_v2, "v": 1}
+    announce_data = {"port": 1, "addresses": [], "rooms": [], "reply_port": 0}
+
+    service._remember_peer(envelope_v2, dict(announce_data), ("127.0.0.1", 1), wire_version=2)
+    service._remember_peer(envelope_v1, dict(announce_data), ("127.0.0.1", 1), wire_version=1)
+    # The v1 beacon (older clients, or our own dual announce) must not make a
+    # v2-capable peer look legacy — that stalled the mesh in 6.0.0.
+    assert service.peers["clid-peer"].wire_version == 2
+
+    # A genuinely legacy peer stays legacy.
+    peer = Peer("clid-other", "old", "general", 1, [], int(time.time() * 1000), wire_version=1)
+    service.peers["clid-other"] = peer
+    service._remember_peer(
+        envelope_v1, dict(announce_data), ("127.0.0.1", 1), wire_version=1
+    )
+    assert service.peers["clid-other"].wire_version == 1

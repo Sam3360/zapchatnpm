@@ -209,7 +209,11 @@ export class RoomRegistry {
     existing.addresses = mergeAddresses(existing.addresses, contact.addresses);
     existing.lastSeen = now;
     if (options.wireVersion !== undefined) {
-      existing.wireVersion = options.wireVersion;
+      // Never downgrade: clients that speak several wire versions announce in
+      // all of them (v6+ sends v1 AND v2 beacons every few seconds), so the
+      // last packet to arrive must not re-classify a v2-capable peer as
+      // legacy — that used to stall the mesh until a manual /connect.
+      existing.wireVersion = Math.max(existing.wireVersion, options.wireVersion);
     }
     if (source === 'manual') {
       existing.source = 'manual';

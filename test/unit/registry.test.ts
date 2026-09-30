@@ -45,6 +45,22 @@ describe('presence', () => {
     assert.equal(result.peer.room, 'coding');
   });
 
+  it('never downgrades a v2-capable peer to legacy (v6 dual beacons)', () => {
+    // v6+ clients announce in every wire version they speak, so beacons for
+    // the same peer arrive stamped v1 and v2 in arbitrary order. The record
+    // must keep the highest version seen — a downgrade used to make the
+    // dialer skip the peer and stall the mesh.
+    const registry = makeRegistry();
+    registry.upsertPeer(contact({ clientId: 'zc-a' }), 'lan', NOW, { wireVersion: 2 });
+    registry.upsertPeer(contact({ clientId: 'zc-a' }), 'lan', NOW + 1, { wireVersion: 1 });
+    assert.equal(registry.getPeer('zc-a')?.wireVersion, 2);
+
+    // And a genuinely legacy peer stays legacy.
+    registry.upsertPeer(contact({ clientId: 'zc-b' }), 'lan', NOW, { wireVersion: 1 });
+    registry.upsertPeer(contact({ clientId: 'zc-b' }), 'lan', NOW + 1, { wireVersion: 1 });
+    assert.equal(registry.getPeer('zc-b')?.wireVersion, 1);
+  });
+
   it('tracks online/offline and removes stale peers', () => {
     const registry = makeRegistry(1000);
     registry.upsertPeer(contact({ clientId: 'zc-a' }), 'lan', NOW);

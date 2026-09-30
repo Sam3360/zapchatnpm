@@ -67,8 +67,16 @@ class DiscoveryService:
         self._running = False
         self._lock = threading.Lock()
         self._beacon_sources = {}  # client_id -> (ip, port) of last beacon
+        # client_id -> (ip, udp_port) for direct unicast beacons. Multicast
+        # delivery is lossy (on Windows a multicast-only listener routinely
+        # receives only the FIRST packet of a back-to-back pair — which starved
+        # it of one whole wire version and deadlocked the dial tie-break), so
+        # once a peer is known we maintain the reliable unicast path too.
+        self._peer_reply_ports = {}
         self._owns_discovery_port = False
-        self._replied_to = set()  # client ids we have unicast-replied to
+        # client id -> last unicast-reply time (rate-limited, not fire-once:
+        # one lost UDP reply used to blind the peer to us for the whole run)
+        self._reply_times = {}
 
     # ------------------------------------------------------------------ state
 
@@ -221,11 +229,39 @@ class DiscoveryService:
                 except OSError as error:
                     self.on_warning(f"beacon to {target[0]} failed: {error}")
 
+    def send_unicast_beacons(self):
+        """Unicast a beacon straight to every known peer's reply port.
+
+        Multicast and broadcast are best-effort; this is the reliable path
+        that keeps the mesh converging even when multicast packets get lost.
+        Both wire versions are sent so classification never depends on which
+        single multicast packet happened to arrive.
+        """
+        if self._sock is None:
+            return
+        for client_id in list(self._peer_reply_ports.keys()):
+            peer = self.peers.get(client_id)
+            if peer is None or not peer.fresh():
+                self._peer_reply_ports.pop(client_id, None)
+                continue
+
+            target = self._peer_reply_ports[client_id]
+            for version in SUPPORTED_WIRE_VERSIONS:
+                try:
+                    packet = json.dumps(
+                        self.build_beacon(version=version), separators=(",", ":")
+                    ).encode("utf-8")[:MAX_UDP_PACKET_BYTES]
+                    self._sock.sendto(packet, target)
+                    self.beacons_sent += 1
+                except OSError:
+                    break
+
     def _announce_loop(self):
         import time
 
         while self._running:
             self.send_beacon()
+            self.send_unicast_beacons()
             time.sleep(ANNOUNCE_INTERVAL)
 
     # -------------------------------------------------------------- receiving
@@ -277,23 +313,33 @@ class DiscoveryService:
                 peer.port = data["port"]
                 if data["addresses"]:
                     peer.addresses = data["addresses"]
-                peer.wire_version = wire_version
+                # Never downgrade: v6+ clients announce in every wire version
+                # they speak (v1 AND v2 beacons), so the last packet to arrive
+                # must not re-classify a v2-capable peer as legacy — that
+                # stalled the mesh until a manual /connect.
+                peer.wire_version = max(peer.wire_version, wire_version)
                 peer.last_seen = now_ms()
 
             self.peers[client_id] = peer
             # Remember where the beacon came from so TCP can dial it even if
             # the advertised address list was empty.
             self._beacon_sources[client_id] = source_address[0]
+            if data["reply_port"]:
+                self._peer_reply_ports[client_id] = (source_address[0], data["reply_port"])
 
             for room in data["rooms"] or ([peer.room] if peer.room else []):
                 entry = self.rooms.setdefault(room, {"online": 0, "seen": 0})
                 entry["seen"] = now_ms()
 
-        # First contact: reply by direct unicast so the other side learns us
-        # even when multicast/broadcast is unavailable (the Python protocol
-        # carries a replyPort for exactly this; npm peers ignore it).
-        if client_id not in self._replied_to and data["reply_port"]:
-            self._replied_to.add(client_id)
+        # Direct unicast reply so the other side learns us even when
+        # multicast/broadcast is unavailable (the Python protocol carries a
+        # replyPort for exactly this; npm peers ignore it). Replied per beacon
+        # window, not once ever: UDP is lossy, and a single lost reply used to
+        # leave the other side blind to us for the whole session.
+        now = now_ms()
+        last_reply = self._reply_times.get(client_id, 0)
+        if data["reply_port"] and now - last_reply > 2000:
+            self._reply_times[client_id] = now
             try:
                 if self._sock is not None:
                     # Reply with the version the peer itself understands.

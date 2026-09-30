@@ -45,6 +45,7 @@ zapchat 6.0.0 — LAN chat, no accounts, no server
 | Command | What it does |
 | --- | --- |
 | `/help` | Show the command list |
+| `Tab` | Complete `/commands`, `@usernames` and `#rooms` while typing (readline; POSIX shells and most terminals) |
 | `/rooms` | Rooms discovered on the LAN |
 | `/users` `/who` | Who is on the LAN and connected |
 | `/join <room>` | Join a room (created if nobody is in it) |

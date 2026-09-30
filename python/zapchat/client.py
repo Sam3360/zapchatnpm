@@ -103,6 +103,16 @@ class ChatClient:
         self._seen_order = []
         # legacy peers we already warned about (once per client id)
         self._legacy_warned = set()
+        # (address, port) -> threading.Event for handshakes in flight. The CLI
+        # dial loop retries every second, so without this guard several
+        # concurrent dials race their handshakes against the same peer; the
+        # acceptor's duplicate-check is not atomic, and both sides can end up
+        # registered on different sockets — which then fail AEAD integrity and
+        # flap connected/left forever (the v6.0.0 stall).
+        self._pending_dials = {}
+        # (address, port) -> client_id of the peer a successful dial added,
+        # so followers of a concurrent dial can report the same outcome.
+        self._dial_targets = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -170,6 +180,11 @@ class ChatClient:
         with self._lock:
             return {client_id: link["mode"] for client_id, link in self._links.items()}
 
+    def peer_usernames(self):
+        """Usernames of every connected peer (for tab completion)."""
+        with self._lock:
+            return [link["username"] for link in self._links.values()]
+
     # ------------------------------------------------------------- connecting
 
     def connect_to(self, address, port, timeout=3.0, plaintext="auto"):
@@ -180,22 +195,53 @@ class ChatClient:
         "auto" tries v2 first, then — only when plaintext links are allowed —
         one plaintext retry if the peer did not speak v2 (the npm client's
         manual-connect behaviour).
+
+        Concurrent dials to the same destination are collapsed: followers
+        wait for the in-flight handshake and adopt its outcome, instead of
+        racing a second one (the acceptor's duplicate-check is not atomic, so
+        two racing handshakes could register mismatched sessions on the two
+        sides — links then fail AEAD integrity and flap forever).
         """
         if plaintext is True and not self.allow_plaintext:
             self._warn_legacy_once("manual", "plaintext links are disabled (use --allow-plaintext)")
             return False
 
+        key = (address, port)
+        pending = self._pending_dials.get(key)
+        if pending is not None:
+            pending.wait(timeout + HELLO_TIMEOUT_SECONDS + 1.0)
+            with self._lock:
+                client_id = self._dial_targets.get(key, "")
+                return bool(client_id) and client_id in self._links
+
+        done = threading.Event()
+        self._pending_dials[key] = done
+        try:
+            return self._connect_inner(address, port, timeout, plaintext, key, done)
+        finally:
+            done.set()
+            self._pending_dials.pop(key, None)
+            self._dial_targets.pop(key, None)
+
+    def _connect_inner(self, address, port, timeout, plaintext, key, done):
         if plaintext is True:
-            return self._connect_plain(address, port, timeout=timeout)
+            ok = self._connect_plain(address, port, timeout=timeout, dial_key=key)
+        else:
+            ok, spoke_v2 = self._connect_secure(address, port, timeout=timeout, dial_key=key)
+            if not ok and self.allow_plaintext and plaintext == "auto" and not spoke_v2:
+                # The peer never spoke a byte of v2: almost certainly a
+                # zapchat <= 5 legacy peer. Retry in plaintext, when allowed.
+                ok = self._connect_plain(address, port, timeout=timeout, dial_key=key)
 
-        ok, spoke_v2 = self._connect_secure(address, port, timeout=timeout)
-        if ok or not self.allow_plaintext or plaintext is False:
-            return ok
-
-        if spoke_v2:
-            return ok  # the peer spoke v2 and the handshake still failed: do not retry
-
-        return self._connect_plain(address, port, timeout=timeout)
+        if ok:
+            # Remember who answered at this destination so followers of a
+            # collapsed dial report the same outcome.
+            with self._lock:
+                for client_id, link in self._links.items():
+                    if link.get("dial_key") == key:
+                        self._dial_targets[key] = client_id
+                        break
+        return ok
 
     def connect_to_peer_object(self, peer):
         """Dial a discovery.Peer, trying its advertised addresses in turn.
@@ -229,7 +275,7 @@ class ChatClient:
 
     # ------------------------------------------------- secure (v2) dialling
 
-    def _connect_secure(self, address, port, timeout=3.0):
+    def _connect_secure(self, address, port, timeout=3.0, dial_key=None):
         """Run the v2 handshake as initiator. Returns (ok, peer_spoke_v2)."""
         try:
             sock = socket.create_connection((address, port), timeout=timeout)
@@ -238,6 +284,7 @@ class ChatClient:
             return False, True  # transport-level failure: not a protocol verdict
 
         sock.settimeout(HELLO_TIMEOUT_SECONDS)
+        spoke_v2 = False  # any v2 byte from the peer flips this
         try:
             mine = create_key_exchange(self.identity_seed)
             hello = self._build_hello(key_exchange=mine)
@@ -246,14 +293,19 @@ class ChatClient:
             reader = SecureFrameReader()
             reply = None
             while reply is None:
-                chunk = sock.recv(4096)
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    # No v2 byte ever came back: on a LAN this is almost always
+                    # a zapchat <= 5 peer that cannot speak v2 at all.
+                    return False, spoke_v2
                 if not chunk:
                     sock.close()
-                    return False, False  # peer never spoke v2: maybe legacy
+                    return False, spoke_v2  # peer never spoke v2: maybe legacy
                 frames = reader.push(chunk)
                 if frames is None:
                     sock.close()
-                    return False, False
+                    return False, spoke_v2
                 for frame in frames:
                     if frame.seq != 0:
                         sock.close()
@@ -286,6 +338,7 @@ class ChatClient:
                 mode="secure",
                 session=SecureSession(keys.send, keys.recv),
                 reader=SecureFrameReader(reader._buffer),
+                dial_key=dial_key,
             ):
                 return False, spoke_v2
 
@@ -297,11 +350,11 @@ class ChatClient:
             return True, spoke_v2
         except (OSError, ValueError):
             self._quiet_close(sock)
-            return False, True
+            return False, spoke_v2
 
     # ------------------------------------------------- plaintext (v1) dialling
 
-    def _connect_plain(self, address, port, timeout=3.0):
+    def _connect_plain(self, address, port, timeout=3.0, dial_key=None):
         """Legacy v1 handshake (newline-delimited JSON), as before v6."""
         try:
             sock = socket.create_connection((address, port), timeout=timeout)
@@ -323,7 +376,7 @@ class ChatClient:
             sock.close()
             return False
 
-        if not self._register_link(sock, peer_envelope, mode="plain"):
+        if not self._register_link(sock, peer_envelope, mode="plain", dial_key=dial_key):
             return False
 
         # The handshake timeout must not linger: an idle chat link is healthy,
@@ -423,7 +476,7 @@ class ChatClient:
             return False
         return True
 
-    def _register_link(self, sock, envelope, mode, session=None, reader=None):
+    def _register_link(self, sock, envelope, mode, session=None, reader=None, dial_key=None):
         """Record a completed handshake. Returns False when refused."""
         with self._lock:
             if envelope["from"] in self._links or len(self._links) >= MAX_PEERS:
@@ -437,6 +490,7 @@ class ChatClient:
                 "mode": mode,
                 "session": session,
                 "reader": reader,
+                "dial_key": dial_key,
             }
         return True
 
