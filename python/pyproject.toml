@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zapchat"
-version = "5.0.0"
+version = "6.0.0"
 description = "Terminal-native LAN chat. No accounts, no cloud, no servers - just your local network."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Samarth Chugh (Sam3360)" }]
-keywords = ["lan", "chat", "cli", "terminal", "p2p", "udp", "discovery", "local-network"]
+keywords = ["lan", "chat", "cli", "terminal", "p2p", "udp", "discovery", "local-network", "encryption", "e2ee"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
@@ -20,7 +20,9 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Communications :: Chat",
 ]
-dependencies = []
+dependencies = [
+    "cryptography>=41",
+]
 
 [project.optional-dependencies]
 dev = ["build>=1.2"]

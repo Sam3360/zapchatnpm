@@ -11,7 +11,13 @@ import re
 import time
 import uuid
 
-PROTOCOL_VERSION = 1
+# v6 speaks wire protocol v2 natively (encrypted TCP mesh, see crypto.py and
+# secure_framing.py). v1 (plaintext newline-delimited JSON) is the legacy
+# wire version of the pre-v6 Python client; it is accepted only behind the
+# opt-in `--allow-plaintext` flag, exactly like the npm client.
+PROTOCOL_VERSION = 2
+LEGACY_WIRE_VERSION = 1
+SUPPORTED_WIRE_VERSIONS = (LEGACY_WIRE_VERSION, PROTOCOL_VERSION)
 
 # CTCP-style action framing (`/me waves` -> 0x01 ACTION waves 0x01), matching
 # the npm client: no protocol change, v1-only peers render it as plain text.
@@ -102,10 +108,14 @@ def sanitize_address_list(value, max_addresses=8):
     return kept
 
 
-def create_envelope(msg_type, sender_id, username, room=None, data=None, env_id=None, ts=None):
-    """Build an envelope to send. Senders always use this helper."""
+def create_envelope(msg_type, sender_id, username, room=None, data=None, env_id=None, ts=None, version=None):
+    """Build an envelope to send. Senders always use this helper.
+
+    `version` re-stamps the wire version (v1 for opt-in plaintext links to
+    legacy peers); the default stamps our native PROTOCOL_VERSION.
+    """
     return {
-        "v": PROTOCOL_VERSION,
+        "v": version if version is not None else PROTOCOL_VERSION,
         "id": env_id or new_message_id(),
         "type": msg_type,
         "ts": ts if ts is not None else now_ms(),
@@ -136,11 +146,17 @@ def _coerce_room(value):
     return False  # invalid: reject the whole envelope
 
 
-def parse_envelope(raw, clock_skew_check=True):
-    """Validate an untrusted value into an envelope dict, or None."""
+def parse_envelope(raw, clock_skew_check=True, allowed_versions=None):
+    """Validate an untrusted value into an envelope dict, or None.
+
+    `allowed_versions` limits the accepted wire versions (default: both v1
+    and v2). The returned dict carries the envelope's own version in `"v"`.
+    """
     if not isinstance(raw, dict):
         return None
-    if raw.get("v") != PROTOCOL_VERSION:
+    accepted = SUPPORTED_WIRE_VERSIONS if allowed_versions is None else tuple(allowed_versions)
+    version = raw.get("v")
+    if version not in accepted:
         return None
 
     env_id = raw.get("id")
@@ -166,7 +182,7 @@ def parse_envelope(raw, clock_skew_check=True):
         return None
 
     return {
-        "v": PROTOCOL_VERSION,
+        "v": version,
         "id": env_id,
         "type": msg_type,
         "ts": ts,
@@ -275,16 +291,43 @@ def parse_room_list_data(data):
     return {"rooms": rooms}
 
 
+def parse_hello_data(data):
+    """Validate a HELLO payload; returns (info, key_exchange) where either
+    part can be None. `info` carries port/addresses/rooms/reply_port (the
+    same shape `parse_announce_data` returns); `key_exchange` is a parsed
+    crypto.KeyExchange when the HELLO carried one (protocol v2), else None.
+    Returns (None, None) when the payload itself is invalid.
+    """
+    info = parse_announce_data(data)
+    if info is None:
+        return None, None
+
+    exchange = None
+    if isinstance(data, dict) and "keyExchange" in data:
+        from .crypto import parse_key_exchange_from_wire
+
+        exchange = parse_key_exchange_from_wire(data["keyExchange"])
+        if exchange is None:
+            # A malformed or badly-signed exchange is the same as none: the
+            # caller decides whether that is fatal (secure mode) or ignorable
+            # (plaintext mode, where npm v1 peers send no exchange at all).
+            return info, None
+
+    return info, exchange
+
+
 def encode_envelope(envelope):
     """Serialise one envelope as a TCP frame (JSON plus newline)."""
     return (json.dumps(envelope, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def decode_frames(chunk, buffer=""):
+def decode_frames(chunk, buffer="", allowed_versions=None):
     """Split received bytes into envelopes.
 
     TCP gives us arbitrary chunks; JSON envelopes are newline-delimited.
-    Returns (envelopes, leftover_bytes_str). Invalid lines are dropped.
+    `allowed_versions` limits the accepted wire versions (see
+    `parse_envelope`). Returns (envelopes, leftover_bytes_str). Invalid lines
+    are dropped.
     """
     text = buffer + chunk.decode("utf-8", errors="replace")
     envelopes = []
@@ -296,7 +339,7 @@ def decode_frames(chunk, buffer=""):
             raw = json.loads(line)
         except ValueError:
             continue
-        envelope = parse_envelope(raw)
+        envelope = parse_envelope(raw, allowed_versions=allowed_versions)
         if envelope is not None:
             envelopes.append(envelope)
     return envelopes, text

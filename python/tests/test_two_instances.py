@@ -110,6 +110,11 @@ def test_two_instances_chat():
             # A /command runs locally without being sent as chat.
             alice.send("/rooms")
             assert alice.wait_for("general", timeout=5), f"alice output: {alice.output()!r}"
+
+            # /status reports the live link count (the command was broken in
+            # <= 5.0.0: it fell through the /me branch and never ran).
+            alice.send("/status")
+            assert alice.wait_for("peers: 1", timeout=5), f"alice output: {alice.output()!r}"
         finally:
             alice.stop()
             bob.stop()

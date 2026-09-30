@@ -11,8 +11,11 @@ import sys
 import threading
 
 from .protocol import (
+    LEGACY_WIRE_VERSION,
     MAX_UDP_PACKET_BYTES,
     MAX_USERNAME_LENGTH,
+    PROTOCOL_VERSION,
+    SUPPORTED_WIRE_VERSIONS,
     create_envelope,
     now_ms,
     parse_announce_data,
@@ -28,13 +31,16 @@ PEER_STALE_SECONDS = 7
 class Peer:
     """Another instance seen on the LAN."""
 
-    def __init__(self, client_id, username, room, port, addresses, last_seen):
+    def __init__(self, client_id, username, room, port, addresses, last_seen, wire_version=PROTOCOL_VERSION):
         self.client_id = client_id
         self.username = username
         self.room = room
         self.port = port
         self.addresses = addresses
         self.last_seen = last_seen
+        # Wire protocol the peer announced with (2 = encrypted-capable, 1 =
+        # legacy plaintext-only). TCP dialling picks its mode from this.
+        self.wire_version = wire_version
 
     def fresh(self, now=None):
         return now_ms() - self.last_seen < PEER_STALE_SECONDS * 1000
@@ -182,7 +188,7 @@ class DiscoveryService:
             pass
         return addresses
 
-    def build_beacon(self):
+    def build_beacon(self, version=PROTOCOL_VERSION):
         local_port = self._sock.getsockname()[1] if self._sock is not None else 0
         return create_envelope(
             "ANNOUNCE",
@@ -196,18 +202,24 @@ class DiscoveryService:
                 # Where a unicast beacon reaches us directly (Python clients).
                 "replyPort": local_port,
             },
+            version=version,
         )
 
     def send_beacon(self):
         if self._sock is None:
             return
-        packet = json.dumps(self.build_beacon(), separators=(",", ":")).encode("utf-8")[:MAX_UDP_PACKET_BYTES]
-        for target in self.beacon_targets():
-            try:
-                self._sock.sendto(packet, target)
-                self.beacons_sent += 1
-            except OSError as error:
-                self.on_warning(f"beacon to {target[0]} failed: {error}")
+        # One beacon per supported wire version (npm v5 behaviour): v2 for
+        # v6+ peers, v1 so pre-6 Python clients still see us.
+        for version in SUPPORTED_WIRE_VERSIONS:
+            packet = json.dumps(
+                self.build_beacon(version=version), separators=(",", ":")
+            ).encode("utf-8")[:MAX_UDP_PACKET_BYTES]
+            for target in self.beacon_targets():
+                try:
+                    self._sock.sendto(packet, target)
+                    self.beacons_sent += 1
+                except OSError as error:
+                    self.on_warning(f"beacon to {target[0]} failed: {error}")
 
     def _announce_loop(self):
         import time
@@ -230,7 +242,7 @@ class DiscoveryService:
             except ValueError:
                 continue
 
-            envelope = parse_envelope(raw)
+            envelope = parse_envelope(raw, allowed_versions=SUPPORTED_WIRE_VERSIONS)
             if envelope is None:
                 continue
 
@@ -243,9 +255,9 @@ class DiscoveryService:
                 continue
 
             self.beacons_received += 1
-            self._remember_peer(envelope, data, address)
+            self._remember_peer(envelope, data, address, wire_version=envelope["v"])
 
-    def _remember_peer(self, envelope, data, source_address):
+    def _remember_peer(self, envelope, data, source_address, wire_version=PROTOCOL_VERSION):
         with self._lock:
             client_id = envelope["from"]
             peer = self.peers.get(client_id)
@@ -257,6 +269,7 @@ class DiscoveryService:
                     port=data["port"],
                     addresses=data["addresses"],
                     last_seen=now_ms(),
+                    wire_version=wire_version,
                 )
             else:
                 peer.username = envelope["username"]
@@ -264,6 +277,7 @@ class DiscoveryService:
                 peer.port = data["port"]
                 if data["addresses"]:
                     peer.addresses = data["addresses"]
+                peer.wire_version = wire_version
                 peer.last_seen = now_ms()
 
             self.peers[client_id] = peer
@@ -282,7 +296,10 @@ class DiscoveryService:
             self._replied_to.add(client_id)
             try:
                 if self._sock is not None:
-                    packet = json.dumps(self.build_beacon(), separators=(",", ":")).encode("utf-8")
+                    # Reply with the version the peer itself understands.
+                    packet = json.dumps(
+                        self.build_beacon(version=wire_version), separators=(",", ":")
+                    ).encode("utf-8")
                     self._sock.sendto(packet, (source_address[0], data["reply_port"]))
                     self.beacons_sent += 1
             except OSError:

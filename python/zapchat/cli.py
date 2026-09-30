@@ -6,6 +6,7 @@ is printed. Type /help to see the commands.
 """
 
 import argparse
+import base64
 import os
 import sys
 import threading
@@ -14,6 +15,7 @@ import uuid
 
 from .client import ChatClient
 from .discovery import DiscoveryService, DISCOVERY_PORT
+from .identity import PeerPinStore, identity_key_id, new_identity_seed
 from .protocol import (
     MAX_USERNAME_LENGTH,
     is_action_message,
@@ -56,12 +58,33 @@ def config_path():
     return os.path.join(directory, "config.json")
 
 
+def _valid_identity_seed(value):
+    """True when `value` is a usable base64 Ed25519 seed (32 bytes)."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return False
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except (ValueError, TypeError):
+        return False
+
+
 def load_or_create_config(name_override=None):
-    """Read the config file, creating it when missing. Never fatal."""
+    """Read the config file, creating it when missing. Never fatal.
+
+    Since v6 the config also carries the long-term identity seed (our TOFU
+    identity, base64) and the peer pin map. Missing or corrupt entries are
+    regenerated, never fatal — matching the npm client's repair behaviour.
+    """
     import json
 
     path = config_path()
-    config = {"clientId": "zpy-" + uuid.uuid4().hex, "username": "", "lastRoom": DEFAULT_ROOM}
+    config = {
+        "clientId": "zpy-" + uuid.uuid4().hex,
+        "username": "",
+        "lastRoom": DEFAULT_ROOM,
+        "identitySeed": base64.b64encode(new_identity_seed()).decode("ascii"),
+        "peerPins": {},
+    }
 
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -73,6 +96,10 @@ def load_or_create_config(name_override=None):
                 config["username"] = stored["username"]
             if isinstance(stored.get("lastRoom"), str):
                 config["lastRoom"] = stored["lastRoom"]
+            if _valid_identity_seed(stored.get("identitySeed")):
+                config["identitySeed"] = stored["identitySeed"]
+            if isinstance(stored.get("peerPins"), dict):
+                config["peerPins"] = stored["peerPins"]
     except (OSError, ValueError):
         pass
 
@@ -82,6 +109,14 @@ def load_or_create_config(name_override=None):
     if not sanitize_username(config["username"]):
         config["username"] = default_username()
 
+    save_config(config, path)
+    return config, path
+
+
+def save_config(config, path):
+    """Write the config back out. Best-effort, never fatal."""
+    import json
+
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -89,13 +124,23 @@ def load_or_create_config(name_override=None):
     except OSError:
         pass
 
-    return config
-
 
 class ChatApp:
     """Wires discovery + the TCP client together and runs the chat loop."""
 
-    def __init__(self, username, room, client_id, no_discovery=False, connect_to=None, tcp_port=45913):
+    def __init__(
+        self,
+        username,
+        room,
+        client_id,
+        no_discovery=False,
+        connect_to=None,
+        tcp_port=45913,
+        identity_seed=None,
+        allow_plaintext=False,
+        pin_seed=None,
+        save_pins=None,
+    ):
         self.username = username
         self.room = room
         self.client_id = client_id
@@ -107,11 +152,20 @@ class ChatApp:
         self.lock = threading.Lock()
         self.connected_usernames = set()
 
+        # TOFU pinning: refuse a peer whose identity key changed for a client
+        # id we have talked to before (an impostor, or a rebuilt install).
+        self.pin_store = PeerPinStore()
+        self.pin_store.seed(pin_seed)
+        self._save_pins = save_pins or (lambda pins: None)
+
         self.chat = ChatClient(
             client_id,
             username,
             get_room=lambda: self.room,
             on_event=self._on_event,
+            identity_seed=identity_seed,
+            allow_plaintext=allow_plaintext,
+            check_peer_pin=self._check_peer_pin,
         )
 
         self.discovery = None
@@ -125,6 +179,13 @@ class ChatApp:
             )
 
     # ------------------------------------------------------------------ events
+
+    def _check_peer_pin(self, client_id, identity_key_id):
+        """TOFU verdict callback; persists new/refreshed pins immediately."""
+        verdict = self.pin_store.check(client_id, identity_key_id)
+        if verdict != "mismatch":
+            self._save_pins(self.pin_store.to_config())
+        return verdict
 
     def _on_event(self, kind, **kwargs):
         if kind == "message":
@@ -281,6 +342,7 @@ class ChatApp:
                 return
             self.chat.send_action(argument)
             self._print(f"* {self.username} {argument.strip()}")
+        elif command == "status":
             discovery = self.discovery
             if discovery is None:
                 self._print("  discovery: off")
@@ -291,6 +353,10 @@ class ChatApp:
                     f" {discovery.beacons_received} received"
                 )
             self._print(f"  tcp port: {self.chat.port}, peers: {len(self.chat.peer_ids)}")
+            modes = self.chat.link_modes()
+            unencrypted = [cid for cid, mode in modes.items() if mode != "secure"]
+            if unencrypted:
+                self._print(f"  WARNING: {len(unencrypted)} link(s) without encryption")
         elif command in ("quit", "q", "exit"):
             raise KeyboardInterrupt
         else:
@@ -308,10 +374,15 @@ def main(argv=None):
     parser.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT, help="UDP discovery port")
     parser.add_argument("--tcp-port", type=int, default=45913, help="first TCP port to try")
     parser.add_argument("--no-discovery", action="store_true", help="manual connections only")
+    parser.add_argument(
+        "--allow-plaintext",
+        action="store_true",
+        help="accept and dial unencrypted legacy (v1) peer links",
+    )
     parser.add_argument("-v", "--version", action="version", version=f"zapchat {__version__}")
     args = parser.parse_args(argv)
 
-    config = load_or_create_config(name_override=args.name)
+    config, config_path_used = load_or_create_config(name_override=args.name)
     room = sanitize_room_name(args.room) if args.room else None
     if room is None and args.room:
         parser.error("room names may only contain letters, digits, - and _")
@@ -325,6 +396,10 @@ def main(argv=None):
         no_discovery=args.no_discovery,
         connect_to=args.connect,
         tcp_port=args.tcp_port,
+        identity_seed=base64.b64decode(config["identitySeed"]),
+        allow_plaintext=args.allow_plaintext,
+        pin_seed=config["peerPins"],
+        save_pins=lambda pins: save_config({**config, "peerPins": pins}, config_path_used),
     )
 
     app.start()

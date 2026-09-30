@@ -58,14 +58,15 @@ zapchat            # same idea: name, rooms, /commands, no accounts
 ```
 
 - The `zapchat` command is installed on your PATH; Python 3.9+ on Windows,
-  macOS or Linux, standard library only (zero dependencies).
-- Same UDP discovery (multicast + broadcast), same TCP messaging, same rooms.
+  macOS or Linux. Since v6 the only dependency is `cryptography` (used for
+  the same encrypted transport the npm client has had since v2).
+- Same UDP discovery (multicast + broadcast), same encrypted TCP messaging,
+  same rooms.
 - Command set is a friendly subset: `/rooms`, `/users`, `/me`, `/join`, `/name`,
   `/connect`, `/status`, `/quit` (see [python/README.md](python/README.md)).
 - Line-based plain-text UI — ideal for SSH sessions, tmux and old terminals.
-- Wire format note: Python and npm speak the same envelope *shapes*, but the
-  npm client's encrypted transport is v2-only (a v1 peer is refused with an
-  upgrade notice) — see *Interoperability* below for exactly what works today.
+- Wire format note: since v6 the Python client speaks wire protocol v2
+  natively (X25519 + AES-256-GCM, same as npm) — see *Interoperability* below.
 
 ## Installation
 
@@ -81,25 +82,27 @@ Terminal. No shell-specific paths or `/bin/bash` assumptions.
 
 ### Interoperability (npm ↔ Python)
 
-Since v5, the two stacks **see each other again on the LAN**: every client
-sends its discovery beacon in both wire versions (v1 for the Python client,
-v2 for npm), and accepts both.
+Since v6, **every current client speaks the same encrypted wire protocol**: the
+Python client implements wire protocol v2 (X25519 + AES-256-GCM, Ed25519-signed
+handshakes, TOFU pinning) exactly like the npm client, and both send their
+discovery beacons in both wire versions so old peers are still *seen*.
 
 Chat compatibility is per-link:
 
 | Link | Works? | How |
 | --- | --- | --- |
 | npm ↔ npm | ✅ | Encrypted TCP (protocol v2: X25519 + AES-256-GCM) — always on |
-| Python ↔ Python | ✅ | JSON envelopes over TCP (protocol v1) |
-| npm ↔ Python | ✅ opt-in | npm peer runs with `--allow-plaintext`; the link is then **unencrypted** v1 |
-| npm (no flag) ↔ Python | ❌ refused | Without the flag npm never opens an unencrypted link |
+| npm ↔ Python (6.0+) | ✅ | Same encrypted v2 link, **no flags needed on either side** |
+| Python 6 ↔ Python 6 | ✅ | Encrypted protocol v2 |
+| Either ↔ Python ≤ 5 | ✅ opt-in | Run the modern peer with `--allow-plaintext`; that one link is **unencrypted** v1 |
+| Either (no flag) ↔ Python ≤ 5 | ❌ refused | Legacy peers are never linked unencrypted by default |
 
-> **The trade-off is real and deliberate.** The Python client cannot do the
-> v2 key exchange, so a cross-stack link is plaintext: anyone capturing LAN
-> traffic can read it. npm therefore refuses these links *by default*, warns
-> loudly when one is opened (`link to X WITHOUT encryption`), and shows a
-> warning in `/status`. Use `--allow-plaintext` when you accept that — e.g.
-> a home network with Python friends.
+> **The plaintext trade-off survives only for genuinely old peers.** A Python
+> client older than 6.0 cannot do the v2 key exchange, so a link to one is
+> plaintext: anyone capturing LAN traffic can read it. Both stacks therefore
+> refuse these links *by default*, warn loudly when one is opened, and show a
+> warning in `/status`. Use `--allow-plaintext` when you accept that — e.g. a
+> home network with a friend who hasn't upgraded yet.
 >
 > Both stacks keep identical envelope shapes, limits and sanitisation rules,
 > and a relayed message is re-stamped per link, so mixed rooms (npm and
@@ -236,7 +239,7 @@ is the port this instance is listening on.
   traffic on your LAN — it is still not anonymous and not a replacement for
   Signal: there is no central authority verifying who anybody "really" is.
   The one exception is opt-in links to legacy v1 peers (`--allow-plaintext`),
-  which are unencrypted and announced as such.
+  which are unencrypted and announced as such — both stacks behave identically.
 - **Internet-free chatting.** With the network cable pulled out but the LAN
   intact, everything still works.
 

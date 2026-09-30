@@ -2,8 +2,14 @@
 
 Requires the built npm CLI (ZAPCHAT_NPM_EXE) and an installed Python CLI
 (ZAPCHAT_EXE). Skips when either is missing so unit-only environments stay
-green. This is the end-to-end check for the v5 beacon + plaintext work:
-discovery must bridge versions, and with --allow-plaintext both sides chat.
+green.
+
+Since v6 both stacks speak wire protocol v2 natively, so the headline case
+needs *no flags at all*: discovery bridges, the TCP link is encrypted, and
+chat flows both ways. The legacy-v1 refusal path is covered by in-process
+tests (test_v6_transport.py) against a raw fake v1 peer; set
+ZAPCHAT_LEGACY_EXE to a real pre-6 Python zapchat (e.g. `pip install
+zapchat==5.0.0` in a venv) to also exercise that path against a real client.
 """
 
 import os
@@ -118,12 +124,16 @@ needs_both = pytest.mark.skipif(
 
 
 @needs_both
-def test_npm_and_python_discover_and_chat():
+def test_npm_and_python_chat_encrypted_without_flags():
+    """The v6 headline: zero flags, encrypted cross-stack chat.
+
+    npm starts first and owns the shared UDP discovery port; the Python
+    client then falls back to multicast-only beacons, which npm still
+    receives. Both sides speak wire v2, so the TCP link is secure with no
+    opt-in on either end.
+    """
     with tempfile.TemporaryDirectory() as tmp:
-        # npm starts first and owns the shared UDP discovery port; the Python
-        # client then falls back to multicast-only beacons, which npm still
-        # receives. Starting both at once makes the port race nondeterministic.
-        npm = Instance(NPM_EXE, "npm-alice", os.path.join(tmp, "npm"), ["--allow-plaintext"])
+        npm = Instance(NPM_EXE, "npm-alice", os.path.join(tmp, "npm"))
         assert npm.wait_for("listening tcp", timeout=15), f"npm never started: {npm.output()!r}"
         time.sleep(1)
         python = Instance(PY_EXE, "py-bob", os.path.join(tmp, "py"), headless=False)
@@ -145,20 +155,26 @@ def test_npm_and_python_discover_and_chat():
 
 
 @needs_both
-def test_python_dials_older_npm_without_flag():
-    """Without --allow-plaintext the npm client still discovers (beacons) but
-    must NOT open an unencrypted chat link to the v1 Python peer."""
+def test_npm_refuses_legacy_python_peer():
+    """A real pre-6 Python client (wire v1) still gets no link without flags.
+
+    Set ZAPCHAT_LEGACY_EXE to a Python zapchat <= 5.0.0 executable to run.
+    """
+    legacy_exe = os.environ.get("ZAPCHAT_LEGACY_EXE")
+    if not legacy_exe:
+        pytest.skip("set ZAPCHAT_LEGACY_EXE to a pre-6 Python zapchat to run this test")
+
     with tempfile.TemporaryDirectory() as tmp:
         npm = Instance(NPM_EXE, "npm-strict", os.path.join(tmp, "npm"))
         assert npm.wait_for("listening tcp", timeout=15), f"npm never started: {npm.output()!r}"
         time.sleep(1)
-        python = Instance(PY_EXE, "py-carol", os.path.join(tmp, "py"), headless=False)
+        python = Instance(legacy_exe, "py-carol", os.path.join(tmp, "py"), headless=False)
 
         try:
-            # Give discovery time, then confirm no encrypted link was claimed.
+            # Give discovery time, then confirm no unencrypted link was opened.
             time.sleep(12)
             assert "connected to py-carol" not in npm.output(), (
-                f"npm linked without the flag: {npm.output()!r}"
+                f"npm linked a legacy peer without the flag: {npm.output()!r}"
             )
         finally:
             npm.stop()
