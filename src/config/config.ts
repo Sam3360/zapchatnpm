@@ -198,7 +198,12 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadConfigResult {
   try {
     contents = fs.readFileSync(filePath, 'utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    // ENOENT = no config file; ENOTDIR = a path component (e.g. an
+    // unwritable or bogus "directory") is a file. Both mean "no readable
+    // config can exist at this path": Windows reports the second case as
+    // ENOENT, POSIX as ENOTDIR, so both must take the create-defaults path.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
       const config = buildDefaultConfig(now, '');
       const written = trySave(config, filePath);
       return {
