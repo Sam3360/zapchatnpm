@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zapchat"
-version = "7.0.0"
+version = "7.0.1"
 description = "Terminal-native LAN chat. No accounts, no cloud, no servers - just your local network."
 readme = "README.md"
 requires-python = ">=3.9"

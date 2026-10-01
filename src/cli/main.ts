@@ -7,8 +7,9 @@
  * TUI or the headless loop. All networking lives in `core/client.ts`.
  */
 
+import { realpathSync } from 'node:fs';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { ZapClient } from '../core/client.js';
 import { DEFAULT_ROOM, DEFAULT_TCP_PORT_BASE } from '../protocol/constants.js';
 import { isValidHost } from '../protocol/sanitize.js';
@@ -111,12 +112,38 @@ async function connectDirectly(client: ZapClient, target: string): Promise<void>
   }
 }
 
-// Only start the app when this file is executed directly (not when imported by
-// tests). pathToFileURL handles the Windows drive-letter form correctly.
-const entry = process.argv[1];
-const isDirectRun = entry !== undefined && import.meta.url === pathToFileURL(entry).href;
+/**
+ * True when `modulePath` is the script the process was started with.
+ *
+ * The naive comparison (argv[1] === this file's path) is not enough on Unix:
+ * `npm install -g` symlinks the bin (e.g. /opt/homebrew/bin/zapchat ->
+ * ../lib/node_modules/zapchat/dist/cli/main.js), Node then sets argv[1] to
+ * the *symlink* while the module knows its *realpath* — the two never
+ * matched, so main() never ran and the command exited silently on macOS and
+ * Linux (every version since v2; Windows was spared because its .cmd shim
+ * passes the real path). Compare realpaths so symlinked installs work.
+ *
+ * `resolve` is injectable so tests can reproduce the Mac case without
+ * needing symlink privileges.
+ */
+export function isDirectRunOf(
+  modulePath: string,
+  entryArg: string | undefined,
+  resolve: (path: string) => string = p => realpathSync(p),
+): boolean {
+  if (entryArg === undefined) {
+    return false;
+  }
 
-if (isDirectRun) {
+  try {
+    return resolve(entryArg) === resolve(modulePath);
+  } catch {
+    // Unresolvable path: not a match we can prove.
+    return false;
+  }
+}
+
+if (isDirectRunOf(fileURLToPath(import.meta.url), process.argv[1])) {
   void main()
     .then(code => {
       process.exitCode = code;

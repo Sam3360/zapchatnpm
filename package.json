@@ -1,6 +1,6 @@
 {
   "name": "zapchat",
-  "version": "7.0.0",
+  "version": "7.0.1",
   "description": "Terminal-native LAN chat. No accounts, no cloud, no servers — just your local network.",
   "keywords": [
     "lan",
