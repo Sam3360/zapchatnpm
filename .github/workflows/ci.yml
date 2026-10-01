@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} on ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      # Runs the full suite. On Linux, file symlinks need no privilege, so
+      # test/integration/symlink-launch.test.ts executes its real-symlink
+      # e2e ("launches through a real symlink") instead of skipping it —
+      # the regression proof for the v7.0.1 silent-launch fix.
+      - name: Build and test
+        run: npm test
