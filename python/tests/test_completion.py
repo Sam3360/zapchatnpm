@@ -63,6 +63,27 @@ class TestCompletionsFor:
         assert "join" in COMMAND_WORDS
         assert "clear" not in COMMAND_WORDS  # npm-only command
 
+    def test_v8_commands_are_completable(self):
+        assert completions_for("/fi") == ["/file", "/fingerprint"]  # sorted
+        assert completions_for("/re") == ["/react", "/reply"]  # sorted
+        assert completions_for("/i") == ["/identity", "/ids"]  # sorted
+        assert completions_for("/id") == ["/identity", "/ids"]  # sorted
+        assert completions_for("/t") == ["/trust"]
+        assert completions_for("/un") == ["/untrust"]
+
+    def test_message_id_argument_is_left_alone(self):
+        # The first argument to /reply and /react is a message id, not a name.
+        assert completions_for("/reply sam", MEMBERS) == []
+        assert completions_for("/react sam", MEMBERS) == []
+
+    def test_completes_members_from_the_third_word_on(self):
+        # /react <id> <body...>: usernames only kick in after the id.
+        assert completions_for("/react abcd1234 sa", MEMBERS) == ["sam", "sasha"]
+        assert completions_for("/reply abcd1234 @sa", MEMBERS) == ["@sam", "@sasha"]
+
+    def test_no_completion_when_the_third_word_is_empty(self):
+        assert completions_for("/reply abcd1234 ", MEMBERS) == []
+
 
 class TestTabCompleter:
     def test_readline_protocol_returns_matches_in_order(self):

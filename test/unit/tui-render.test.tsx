@@ -11,7 +11,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { renderToString } from 'ink';
+import { render, renderToString } from 'ink';
+import { PassThrough, Writable } from 'node:stream';
 import { describe, it } from 'node:test';
 import { App } from '../../src/tui/App.js';
 import { LobbyScreen } from '../../src/tui/screens/LobbyScreen.js';
@@ -158,6 +159,69 @@ describe('lobby screen', () => {
 
     assert.ok(output.includes('ROOMS'));
     assertFits(output, columns, ROWS);
+  });
+});
+
+/** Fake TTY streams so Ink renders interactively without a real terminal. */
+function fakeTty(): { stdout: NodeJS.WriteStream; stdin: NodeJS.ReadStream; writes: string[] } {
+  const writes: string[] = [];
+  class FakeStdout extends Writable {
+    isTTY = true;
+    columns = 92;
+    rows = 30;
+    override _write(chunk: unknown, _encoding: string, callback: () => void): void {
+      writes.push(String(chunk));
+      callback();
+    }
+  }
+
+  const stdout = new FakeStdout() as unknown as NodeJS.WriteStream;
+  const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+  // Ink only touches these when stdin reports itself as a TTY.
+  Object.assign(stdin, {
+    isTTY: true,
+    setRawMode: () => stdin,
+    ref: () => {},
+    unref: () => {},
+  });
+  return { stdout, stdin, writes };
+}
+
+const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 60));
+
+const stripAnsi = (value: string): string =>
+  // eslint-disable-next-line no-control-regex
+  value.replace(/\u001B\[[0-9;?]*[A-Za-z]/g, '');
+
+describe('live refresh', () => {
+  it('shows a message sent after mount without needing a resize', async () => {
+    // Regression: the room timeline was memoised on `snapshot.messages`, but the
+    // registry handed back the same mutated array every time, so new messages
+    // only appeared after the terminal was resized (which changed `innerWidth`).
+    const client = tempClient({ username: 'tester' });
+    client.join('general');
+
+    const { stdout, stdin, writes } = fakeTty();
+    const instance = render(<App client={client} />, {
+      stdout,
+      stdin,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+
+    try {
+      await flush();
+      client.send('live refresh marker');
+      await flush();
+
+      const output = stripAnsi(writes.join(''));
+      assert.ok(
+        output.includes('live refresh marker'),
+        'the new message is rendered without a resize',
+      );
+    } finally {
+      instance.unmount();
+    }
   });
 });
 

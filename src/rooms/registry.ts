@@ -66,6 +66,12 @@ export interface ChatMessage {
   self: boolean;
   /** Marks locally generated notices, e.g. "you joined #general". */
   tone?: 'info' | 'warn' | 'error';
+  /** v8: id (or unique prefix) of the message this one replies to. */
+  replyTo?: string;
+  /** v8: reaction glyph; the message itself is a reaction, not chat text. */
+  reaction?: string;
+  /** v8: true while this message sits in the offline queue, unsent. */
+  queued?: boolean;
 }
 
 export interface RoomRegistryOptions {
@@ -450,6 +456,33 @@ export class RoomRegistry {
     }
   }
 
+  /**
+   * Flag an already-recorded message as queued (or no longer queued).
+   *
+   * Updates in place: `recordMessage` appends, so re-recording an existing id
+   * would show the same line twice in the timeline. Returns false when no
+   * message with that id is in the room.
+   */
+  setQueued(room: string, messageId: string, queued: boolean): boolean {
+    const bucket = this.#history.get(room);
+    if (bucket === undefined) {
+      return false;
+    }
+
+    const index = bucket.findIndex(message => message.id === messageId);
+    if (index === -1) {
+      return false;
+    }
+
+    const message = bucket[index] as ChatMessage;
+    if (message.queued === queued) {
+      return true;
+    }
+
+    bucket[index] = queued ? { ...message, queued: true } : { ...message, queued: undefined };
+    return true;
+  }
+
   /** Append a locally generated notice (join/leave/error) to a room timeline. */
   appendSystem(
     room: string,
@@ -473,8 +506,16 @@ export class RoomRegistry {
     return message;
   }
 
+  /**
+   * Messages for a room, oldest first.
+   *
+   * Returns a *copy*: the live bucket is mutated in place by `recordMessage`,
+   * so handing it out would give callers (and React's `useMemo` dependencies) a
+   * reference that never changes when new messages arrive.
+   */
   history(room: string): ChatMessage[] {
-    return this.#history.get(room) ?? [];
+    const bucket = this.#history.get(room);
+    return bucket === undefined ? [] : [...bucket];
   }
 
   clearHistory(room: string): void {

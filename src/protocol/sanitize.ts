@@ -148,12 +148,83 @@ export function isValidIpv4(input: string): boolean {
  * Accept an IPv4 address or a DNS-style hostname. Rejects anything with scheme,
  * path, port or whitespace so it can only ever be used as a connect target.
  */
+/**
+ * Validate an IPv6 literal, optionally with a zone id (`fe80::1%eth0`).
+ *
+ * Written out rather than delegated to the URL parser so the accepted grammar
+ * is exactly what we will put in a socket call: up to eight groups of 1-4 hex
+ * digits, at most one `::` elision, and an optional trailing IPv4 quad (which
+ * counts as the last two groups).
+ */
+export function isValidIpv6(input: unknown): boolean {
+  if (typeof input !== 'string' || input.length === 0 || input.length > 45) {
+    return false;
+  }
+
+  // A zone id is only meaningful on link-local, and never contains ':'.
+  let address = input;
+  const zoneAt = address.indexOf('%');
+  if (zoneAt !== -1) {
+    const zone = address.slice(zoneAt + 1);
+    address = address.slice(0, zoneAt);
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(zone)) {
+      return false;
+    }
+  }
+
+  if (address.length === 0 || !address.includes(':')) {
+    return false;
+  }
+
+  const doubleColons = address.split('::').length - 1;
+  if (doubleColons > 1) {
+    return false;
+  }
+
+  const [head, tail] = address.split('::') as [string, string | undefined];
+  // Groups before and after the elision; the trailing part may be empty.
+  const headGroups = head === '' ? [] : head.split(':');
+  const tailGroups =
+    tail === undefined || tail === '' ? [] : (tail as string).split(':');
+
+  let groups = 0;
+  const allGroups = [...headGroups, ...tailGroups];
+  for (const [index, group] of allGroups.entries()) {
+    // A trailing IPv4 quad (`::ffff:192.168.0.1`) stands in for two groups.
+    const isLast = index === allGroups.length - 1;
+    if (group.includes('.')) {
+      if (!isLast || !isValidIpv4(group)) {
+        return false;
+      }
+
+      groups += 2;
+      continue;
+    }
+
+    if (!/^[0-9A-Fa-f]{1,4}$/.test(group)) {
+      return false;
+    }
+
+    groups += 1;
+  }
+
+  // With `::` any count below eight is legal (it stands for the elided zeros);
+  // without it the address must be exactly full.
+  return doubleColons === 1 ? groups <= 8 : groups === 8;
+}
+
 export function isValidHost(input: unknown): input is string {
   if (typeof input !== 'string' || input.length === 0 || input.length > 253) {
     return false;
   }
 
-  if (input.includes(' ') || input.includes('/') || input.includes(':')) {
+  // A host with a colon can only be an IPv6 literal (the `[addr]:port` form is
+  // split off before this runs); a hostname never contains one.
+  if (input.includes(':')) {
+    return isValidIpv6(input);
+  }
+
+  if (input.includes(' ') || input.includes('/')) {
     return false;
   }
 
@@ -175,7 +246,7 @@ export function isValidPort(input: unknown): input is number {
   );
 }
 
-/** Sanitise an IPv4 address list (used for advertised addresses in beacons). */
+/** Sanitise an IP address list (used for advertised addresses in beacons). */
 export function sanitizeAddressList(
   input: unknown,
   max: number,
@@ -188,6 +259,15 @@ export function sanitizeAddressList(
   for (const candidate of input) {
     if (typeof candidate === 'string' && isValidIpv4(candidate)) {
       seen.add(candidate);
+    }
+
+    if (typeof candidate === 'string' && isValidIpv6(candidate)) {
+      // Never advertise a zone id: it is local to this machine and means
+      // nothing to a peer.
+      const address = (candidate.split('%') as [string])[0];
+      if (seen.size < max) {
+        seen.add(address);
+      }
     }
 
     if (seen.size >= max) {

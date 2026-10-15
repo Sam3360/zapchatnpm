@@ -7,6 +7,7 @@
  */
 
 import os from 'node:os';
+import { isValidIpv6 } from '../protocol/sanitize.js';
 
 export interface LocalInterface {
   name: string;
@@ -90,7 +91,47 @@ export function listLocalInterfaces(
   return result;
 }
 
-/** Advertised addresses, most-globally-useful first. */
+/**
+ * Usable IPv6 addresses: up, not loopback, not link-local, not unique-local.
+ *
+ * IPv6 has no directed broadcast, so these are returned on their own rather
+ * than folded into `listLocalInterfaces` (whose `broadcast` field is IPv4-only).
+ */
+export function listLocalV6Addresses(
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): string[] {
+  const result: string[] = [];
+
+  for (const entries of Object.values(interfaces)) {
+    if (entries === undefined) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (entry.family !== 'IPv6' || entry.internal) {
+        continue;
+      }
+
+      const address = entry.address.split('%')[0] as string;
+      const lower = address.toLowerCase();
+      // fe80::/10 is link-local (needs a scope id to be useful) and fc00::/7
+      // is unique-local; neither can reach a peer without extra configuration.
+      if (lower.startsWith('fe8') || lower.startsWith('fe9') ||
+          lower.startsWith('fea') || lower.startsWith('feb') ||
+          lower.startsWith('fc') || lower.startsWith('fd')) {
+        continue;
+      }
+
+      if (isValidIpv6(address)) {
+        result.push(address);
+      }
+    }
+  }
+
+  return [...new Set(result)];
+}
+
+/** Advertised addresses: IPv4 first (most LANs are), then IPv6. */
 export function localAddresses(
   interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
 ): string[] {
@@ -98,6 +139,7 @@ export function localAddresses(
   return [
     ...addresses.filter(isPrivateAddress),
     ...addresses.filter(address => !isPrivateAddress(address)),
+    ...listLocalV6Addresses(interfaces),
   ];
 }
 

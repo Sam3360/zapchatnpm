@@ -188,7 +188,35 @@ export class PeerPinStore {
   }
 
   /**
-   * Check a peer's key id against the pin store.
+   * Pin a peer's current key explicitly (the `/trust` command).
+   *
+   * Useful after a legitimate rebuild: it replaces a stale pin so the next
+   * contact with the new key is accepted instead of refused as a mismatch.
+   */
+  trust(clientId: string, keyId: string, now: number): void {
+    if (clientId.length === 0 || keyId.length === 0) {
+      return;
+    }
+
+    this.#pins.set(clientId, { keyId, seenAt: now });
+  }
+
+  /** Forget a pin (`/untrust`), so the next contact is treated as first contact. */
+  untrust(clientId: string): boolean {
+    return this.#pins.delete(clientId);
+  }
+
+  /** True when this client id currently has a pin on record. */
+  has(clientId: string): boolean {
+    return this.#pins.has(clientId);
+  }
+
+  /** The pinned key id for `clientId`, if any. */
+  keyIdFor(clientId: string): string | undefined {
+    return this.#pins.get(clientId)?.keyId;
+  }
+
+  /** Check a peer's key id against the pin store.
    *
    * Returns `'ok'` when the key matches a pin, `'new'` on first contact (and
    * records the pin), or `'mismatch'` — the dangerous case: this client id has

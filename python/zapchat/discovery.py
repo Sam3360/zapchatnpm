@@ -217,8 +217,13 @@ class DiscoveryService:
         if self._sock is None:
             return
         # One beacon per supported wire version (npm v5 behaviour): v2 for
-        # v6+ peers, v1 so pre-6 Python clients still see us.
-        for version in SUPPORTED_WIRE_VERSIONS:
+        # v6+ peers, v1 so pre-6 Python clients still see us. Newest first:
+        # a receiver creates its peer record from the first packet it sees,
+        # and a record created as v1 makes both sides refuse to dial until
+        # the v2 packet lands — which stalls discovery-made links on lossy
+        # networks. The receiver's never-downgrade `max()` makes the v1
+        # packet that follows harmless.
+        for version in sorted(SUPPORTED_WIRE_VERSIONS, reverse=True):
             packet = json.dumps(
                 self.build_beacon(version=version), separators=(",", ":")
             ).encode("utf-8")[:MAX_UDP_PACKET_BYTES]
@@ -235,7 +240,8 @@ class DiscoveryService:
         Multicast and broadcast are best-effort; this is the reliable path
         that keeps the mesh converging even when multicast packets get lost.
         Both wire versions are sent so classification never depends on which
-        single multicast packet happened to arrive.
+        single multicast packet happened to arrive (newest first — see
+        send_beacon).
         """
         if self._sock is None:
             return
@@ -246,7 +252,7 @@ class DiscoveryService:
                 continue
 
             target = self._peer_reply_ports[client_id]
-            for version in SUPPORTED_WIRE_VERSIONS:
+            for version in sorted(SUPPORTED_WIRE_VERSIONS, reverse=True):
                 try:
                     packet = json.dumps(
                         self.build_beacon(version=version), separators=(",", ":")
@@ -342,9 +348,13 @@ class DiscoveryService:
             self._reply_times[client_id] = now
             try:
                 if self._sock is not None:
-                    # Reply with the version the peer itself understands.
+                    # Advertise the newest version we know this peer speaks
+                    # (never the single version of the packet that just
+                    # arrived — it may have been the v1 twin of a lost v2).
+                    known = self.peers.get(client_id)
+                    reply_version = known.wire_version if known is not None else wire_version
                     packet = json.dumps(
-                        self.build_beacon(version=wire_version), separators=(",", ":")
+                        self.build_beacon(version=reply_version), separators=(",", ":")
                     ).encode("utf-8")
                     self._sock.sendto(packet, (source_address[0], data["reply_port"]))
                     self.beacons_sent += 1

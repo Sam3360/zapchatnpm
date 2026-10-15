@@ -4,6 +4,7 @@
  */
 
 import type { Snapshot } from '../../core/client.js';
+import { formatBytes } from '../../files/transfers.js';
 
 export type StatusKind = 'connected' | 'lan' | 'searching' | 'degraded' | 'offline';
 
@@ -110,9 +111,37 @@ export function footerStatus(snapshot: Snapshot, fallbackHint: string): FooterSt
     return { text: snapshot.status.discoveryDetail, color: 'yellow', dim: false };
   }
 
+  // Queued messages matter more than a stale warning: the user is waiting on
+  // something to actually go out.
+  const queued = snapshot.queued;
+  if (queued.length > 0) {
+    return {
+      text: `${queued.length} message${queued.length === 1 ? '' : 's'} queued — waiting for a peer`,
+      color: 'yellow',
+      dim: false,
+    };
+  }
+
   const warning = snapshot.status.warnings.at(-1);
   if (warning !== undefined) {
     return { text: warning, color: 'yellow', dim: false };
+  }
+
+  // Active file transfers beat the keyboard hint: progress is time-critical.
+  const transfer = snapshot.transfers.at(0);
+  if (transfer !== undefined) {
+    const pct =
+      transfer.size > 0
+        ? Math.min(100, Math.floor((transfer.transferred / transfer.size) * 100))
+        : 0;
+    const arrow = transfer.direction === 'send' ? '↑' : '↓';
+    const verb = transfer.state === 'receiving' ? 'receiving' : transfer.state === 'sending' ? 'sending' : 'offering';
+    const more = snapshot.transfers.length > 1 ? ` (+${snapshot.transfers.length - 1} more)` : '';
+    return {
+      text: `${arrow} ${verb} ${transfer.name} ${pct}% (${formatBytes(transfer.transferred)}/${formatBytes(transfer.size)})${more}`,
+      color: 'cyan',
+      dim: false,
+    };
   }
 
   return { text: fallbackHint, dim: true };

@@ -225,10 +225,33 @@ export function parseArgs(argv: readonly string[]): ParseResult {
   return { ok: true, options };
 }
 
+/**
+ * Split `host`, `host:port` or `[ipv6]:port` into its parts.
+ *
+ * A bracketed literal is unambiguous (`[::1]:45913`). An unbracketed value with
+ * more than one colon is an IPv6 address with no port, never a host:port pair.
+ */
 export function splitTarget(value: string): [string, string | undefined] {
   const trimmed = value.trim();
+
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    if (end !== -1) {
+      const host = trimmed.slice(1, end);
+      const rest = trimmed.slice(end + 1);
+      return [host, rest.startsWith(':') ? rest.slice(1) : undefined];
+    }
+
+    return [trimmed, undefined];
+  }
+
   const separator = trimmed.lastIndexOf(':');
   if (separator === -1) {
+    return [trimmed, undefined];
+  }
+
+  // More than one colon and no brackets: a bare IPv6 literal, not a port.
+  if (trimmed.indexOf(':') !== separator) {
     return [trimmed, undefined];
   }
 

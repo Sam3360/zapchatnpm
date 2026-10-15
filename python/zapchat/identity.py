@@ -88,3 +88,23 @@ class PeerPinStore:
             return "ok"
 
         return "mismatch"
+
+    def get(self, client_id):
+        """Pinned key id for a client id, or None when not pinned."""
+        pin = self._pins.get(client_id)
+        return pin["keyId"] if pin else None
+
+    def trust(self, client_id, key_id, now=None):
+        """Pin a peer's *current* key (`/trust <user>`).
+
+        After a legitimate reinstall a peer presents a new key, which TOFU
+        would refuse as an impostor. Trusting re-pins the key they have now so
+        the link works again — and a third key is still refused.
+        """
+        if now is None:
+            now = int(time.time() * 1000)
+        self._pins[client_id] = {"keyId": key_id, "seenAt": now}
+
+    def untrust(self, client_id):
+        """Forget a pin (`/untrust <user>`). False when there was none."""
+        return self._pins.pop(client_id, None) is not None

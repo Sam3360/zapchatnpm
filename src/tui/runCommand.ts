@@ -7,8 +7,14 @@
  * the activity log.
  */
 
-import type { ZapClient } from '../core/client.js';
+import type { ZapClient, PeerSnapshot, Snapshot } from '../core/client.js';
 import { helpLines, type ParsedCommand } from '../commands/commands.js';
+import { charLength, sanitizeMessageText } from '../protocol/sanitize.js';
+import {
+  REACTION_SET,
+  MAX_REACTION_CHARS,
+  MIN_ID_PREFIX_CHARS,
+} from '../protocol/constants.js';
 import { plural } from './view/status.js';
 
 export interface CommandContext {
@@ -176,10 +182,147 @@ export function runCommand(parsed: ParsedCommand, context: CommandContext): Comm
         );
       }
       print(`protocol    ${status.droppedFrames} rejected frames so far`, 'info');
+      if (snapshot.transfers.length > 0) {
+        print(`transfers   ${snapshot.transfers.length} active`, 'info');
+      }
+      if (snapshot.queued.length > 0) {
+        print(
+          `queued      ${snapshot.queued.length} message${snapshot.queued.length === 1 ? '' : 's'} waiting for a peer`,
+          'warn',
+        );
+      }
+      print(`identity    ${client.identityFingerprint()}`, 'info');
       if (status.warnings.length > 0) {
         for (const warning of status.warnings) {
           print(`warning     ${warning}`, 'warn');
         }
+      }
+
+      return 'handled';
+    }
+
+    case 'identity': {
+      print(`your identity fingerprint: ${client.identityFingerprint()}`, 'info');
+      print('share it with a peer (or run /fingerprint on their side) to verify the link', 'info');
+      return 'handled';
+    }
+
+    case 'fingerprint': {
+      if (parsed.args.length === 0) {
+        print('usage: /fingerprint <username>', 'warn');
+        return 'handled';
+      }
+
+      const peer = findPeerByUsername(client.getSnapshot(), parsed.args);
+      if (peer === undefined) {
+        print(`no peer named "${parsed.args}"`, 'warn');
+        return 'handled';
+      }
+
+      const keyId = client.peerFingerprint(peer.clientId);
+      if (keyId === null) {
+        print(`${peer.username} has not completed a handshake yet — no key to show`, 'warn');
+        return 'handled';
+      }
+
+      print(`${peer.username}  ${peer.clientId}\n  key ${keyId}`, 'info');
+      return 'handled';
+    }
+
+    case 'trust':
+    case 'untrust': {
+      if (parsed.args.length === 0) {
+        print(`usage: /${parsed.name} <username>`, 'warn');
+        return 'handled';
+      }
+
+      const peer = findPeerByUsername(client.getSnapshot(), parsed.args);
+      if (peer === undefined) {
+        print(`no peer named "${parsed.args}"`, 'warn');
+        return 'handled';
+      }
+
+      const result =
+        parsed.name === 'trust'
+          ? client.trust(peer.clientId)
+          : client.untrust(peer.clientId);
+      if (result.ok) {
+        print(
+          parsed.name === 'trust'
+            ? `pinned ${peer.username}'s current key`
+            : `forgot ${peer.username}'s pinned key`,
+          'info',
+        );
+      } else if (result.error !== undefined) {
+        print(result.error, 'error');
+      }
+
+      return 'handled';
+    }
+
+    case 'ids': {
+      // Ids are the targets of /reply and /react, but they are not rendered
+      // inline (the timeline stays clean) — this is where a user finds them.
+      const snapshot = client.getSnapshot();
+      const chat = snapshot.messages.filter(message => message.kind !== 'system');
+      if (chat.length === 0) {
+        print('no messages in this room yet — ids will list here for /reply and /react', 'info');
+        return 'handled';
+      }
+
+      for (const message of [...chat].reverse().slice(0, 20)) {
+        const preview = messagePreview(message);
+        const name = message.username.length > 0 ? message.username : 'someone';
+        print(`${message.id}  ${name}: ${preview}`, 'info');
+      }
+
+      return 'handled';
+    }
+
+    case 'reply': {
+      const reply = parseReplyCommand(parsed.args);
+      if (reply === null) {
+        print('usage: /reply <id|prefix> <text>', 'warn');
+        return 'handled';
+      }
+
+      const result = client.sendReply(reply.targetId, reply.text);
+      if (!result.ok && result.error !== undefined) {
+        print(result.error, 'error');
+      }
+
+      return 'handled';
+    }
+
+    case 'react': {
+      const react = parseReactCommand(parsed.args);
+      if (react === null) {
+        print(`usage: /react <id|prefix> <${REACTION_SET.slice(0, 4).join('|')}|...>`, 'warn');
+        return 'handled';
+      }
+
+      const result = client.sendReaction(react.targetId, react.reaction);
+      if (!result.ok && result.error !== undefined) {
+        print(result.error, 'error');
+      }
+
+      return 'handled';
+    }
+
+    case 'file': {
+      if (parsed.args.length === 0) {
+        print('usage: /file <file-path>  ·  /file cancel [id]', 'warn');
+        return 'handled';
+      }
+
+      // `/file cancel [id]` aborts active transfers (all of them without an id).
+      const cancelMatch = /^cancel(?:\s+(\S+))?$/.exec(parsed.args);
+      const result =
+        cancelMatch === null
+          ? client.offerFile(parsed.args)
+          : client.cancelTransfer(cancelMatch[1]);
+      if (!result.ok && result.error !== undefined) {
+        print(result.error, 'error');
       }
 
       return 'handled';
@@ -191,6 +334,77 @@ export function runCommand(parsed: ParsedCommand, context: CommandContext): Comm
     }
   }
 }
+
+const REPLY_REACTION_WORD_RE = /^[A-Za-z0-9_-]+$/;
+
+/** Resolve a `/fingerprint`, `/trust` or `/untrust` argument to a peer. */
+/** One-line preview of a message for `/ids` (reactions show their emoji). */
+function messagePreview(message: Snapshot['messages'][number]): string {
+  if (message.reaction !== undefined && message.reaction.length > 0) {
+    return `${message.reaction} reacted`;
+  }
+
+  const text = message.text.replace(/\s+/g, ' ').trim();
+  if (text.length === 0) {
+    return '(no text)';
+  }
+
+  return text.length > 60 ? `${text.slice(0, 57)}...` : text;
+}
+
+function findPeerByUsername(snapshot: Snapshot, name: string): PeerSnapshot | undefined {
+  const needle = name.trim().replace(/^@/, '').toLowerCase();
+  return (
+    snapshot.peers.find(peer => peer.username.toLowerCase() === needle) ??
+    // Fall back to a client-id prefix so a peer can always be named.
+    snapshot.peers.find(peer => needle.length >= MIN_ID_PREFIX_CHARS && peer.clientId.startsWith(needle))
+  );
+}
+
+function parseReplyCommand(args: string): { targetId: string; text: string } | null {
+  const spaceAt = args.indexOf(' ');
+  if (spaceAt < 0) {
+    return null;
+  }
+
+  const targetId = args.slice(0, spaceAt);
+  const text = sanitizeMessageText(args.slice(spaceAt + 1));
+
+  if (!REPLY_REACTION_WORD_RE.test(targetId) || targetId.length < MIN_ID_PREFIX_CHARS) {
+    return null;
+  }
+
+  if (text.length === 0) {
+    return null;
+  }
+
+  return { targetId, text };
+}
+
+function parseReactCommand(args: string): { targetId: string; reaction: string } | null {
+  const spaceAt = args.indexOf(' ');
+  if (spaceAt < 0) {
+    return null;
+  }
+
+  const targetId = args.slice(0, spaceAt);
+  const reaction = args.slice(spaceAt + 1).trim();
+
+  if (!REPLY_REACTION_WORD_RE.test(targetId) || targetId.length < MIN_ID_PREFIX_CHARS) {
+    return null;
+  }
+
+  if (!(REACTION_SET as readonly string[]).includes(reaction)) {
+    return null;
+  }
+
+  if (charLength(reaction) > MAX_REACTION_CHARS) {
+    return null;
+  }
+
+  return { targetId, reaction };
+}
+
 
 /** Split `host`, `host:port` or `[ipv6]:port` into parts. */
 export function splitHostPort(value: string): [string, string | undefined] {

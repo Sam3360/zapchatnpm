@@ -8,6 +8,7 @@ is printed. Type /help to see the commands.
 import argparse
 import base64
 import os
+import re
 import sys
 import threading
 import time
@@ -18,15 +19,23 @@ from .discovery import DiscoveryService, DISCOVERY_PORT
 from .identity import PeerPinStore, identity_key_id, new_identity_seed
 from .protocol import (
     MAX_USERNAME_LENGTH,
+    MIN_ID_PREFIX_CHARS,
+    REACTION_SET,
     is_action_message,
+    is_valid_host,
     render_action,
     sanitize_room_name,
     sanitize_username,
+    split_host_port,
 )
+from .transfers import format_bytes as _format_bytes
 from . import __version__
 
 CONFIG_DIR_ENV = "ZAPCHAT_CONFIG_DIR"
 DEFAULT_ROOM = "general"
+
+# Message ids are url-safe, so an id (or prefix) is only these characters.
+_REF_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def default_username():
@@ -125,6 +134,11 @@ def save_config(config, path):
         pass
 
 
+def _valid_ref(value):
+    """True when `value` looks like a message id or a prefix of one."""
+    return bool(value) and len(value) >= MIN_ID_PREFIX_CHARS and _REF_RE.fullmatch(value) is not None
+
+
 class ChatApp:
     """Wires discovery + the TCP client together and runs the chat loop."""
 
@@ -149,6 +163,10 @@ class ChatApp:
         self.tcp_port = tcp_port
 
         self.history = []  # rendered lines kept for /help-style local commands
+        # (id, room, who, preview) for recent messages, oldest first — this is
+        # how users discover the ids /reply and /react take (npm parity: ids
+        # are never rendered inline).
+        self._recent = []
         self.lock = threading.Lock()
         self.connected_usernames = set()
 
@@ -187,24 +205,137 @@ class ChatApp:
             self._save_pins(self.pin_store.to_config())
         return verdict
 
+    def _remember(self, message_id, room, who, text):
+        """Keep a recent message so `/ids` can name targets for /reply//react."""
+        if not message_id:
+            return
+        preview = render_action(who, text) if is_action_message(text) else text
+        preview = " ".join(str(preview).split())[:80]
+        self._recent.append((message_id, room, who, preview))
+        if len(self._recent) > 200:
+            del self._recent[:-200]
+
     def _on_event(self, kind, **kwargs):
         if kind == "message":
-            # Envelope timestamps are in milliseconds; localtime wants seconds.
-            ts = kwargs.get("ts")
-            seconds = (ts / 1000) if isinstance(ts, (int, float)) and ts > 10_000_000_000 else time.time()
-            stamp = time.strftime("%H:%M", time.localtime(seconds))
+            stamp = self._stamp(kwargs.get("ts"))
             text = kwargs["text"]
             if is_action_message(text):
                 # `/me waves` arrives framed; render it as `* sam waves`.
                 self._print(f"{stamp} {render_action(kwargs['sender'], text)}")
             else:
                 self._print(f"{stamp} {kwargs['sender']}: {text}")
+            self._remember(kwargs.get("message_id"), kwargs.get("room"), kwargs["sender"], text)
+        elif kind == "message-sent":
+            # Local echo: you always see your own line, peers or not (v7
+            # printed nothing here, so a sent message seemed to vanish).
+            envelope = kwargs.get("envelope") or {}
+            stamp = self._stamp(envelope.get("ts"))
+            text = (envelope.get("data") or {}).get("text") or ""
+            sender = envelope.get("username") or self.username
+            if is_action_message(text):
+                self._print(f"{stamp} {render_action(sender, text)}")
+            else:
+                self._print(f"{stamp} {sender}: {text}")
+            queued = kwargs.get("queued")
+            if queued is True:
+                self._print(
+                    "! no peers are connected yet — your message is queued "
+                    "and will send when one joins"
+                )
+            elif queued is False:
+                self._print(
+                    "! no peers are connected yet — the offline queue was full, "
+                    "so the oldest queued message was dropped"
+                )
+            self._remember(envelope.get("id"), envelope.get("room"), sender, text)
+        elif kind == "presence":
+            envelope = kwargs.get("envelope") or {}
+            who = envelope.get("username", "a peer")
+            where = envelope.get("room") or self.room
+            if kwargs.get("action") == "LEAVE":
+                self._print(f"* {who} left #{where}")
+            else:
+                self._print(f"* {who} joined #{where}")
+        elif kind == "offline-flushed":
+            count = kwargs.get("count", 0)
+            self._print(
+                f"* sent {count} queued {'message' if count == 1 else 'messages'} "
+                "now that a peer is here"
+            )
         elif kind == "peer-connected":
             self._print(f"* {kwargs['username']} connected")
         elif kind == "peer-gone":
             self._print(f"* {kwargs['username']} left")
         elif kind == "warning":
             self._print(f"! {kwargs['text']}")
+        elif kind == "reply":
+            self._print(
+                f"{self._stamp(kwargs.get('ts'))} {kwargs['sender']} "
+                f"↪ {kwargs['reply_to']}: {kwargs['text']}"
+            )
+            self._remember(
+                kwargs.get("message_id"), kwargs.get("room"), kwargs["sender"], kwargs["text"]
+            )
+        elif kind == "reaction":
+            self._print(f"* {kwargs['sender']} reacted {kwargs['reaction']} to {kwargs['target']}")
+            self._remember(
+                kwargs.get("message_id"),
+                kwargs.get("room"),
+                kwargs["sender"],
+                f"{kwargs['reaction']} reacted",
+            )
+        elif kind == "reply-sent":
+            self._print(f"* replied to {kwargs['reply_to']}")
+            self._remember(
+                kwargs.get("message_id"), kwargs.get("room"), self.username, kwargs["text"]
+            )
+        elif kind == "reaction-sent":
+            self._print(f"* reacted {kwargs['reaction']} to {kwargs['target']}")
+            self._remember(
+                kwargs.get("message_id"),
+                kwargs.get("room"),
+                self.username,
+                f"{kwargs['reaction']} reacted",
+            )
+        elif kind == "file-offer-out":
+            self._print(
+                f"* offering {kwargs['name']} ({_format_bytes(kwargs['size'])}) "
+                f"— waiting for someone to accept"
+            )
+        elif kind == "file-receiving":
+            self._print(
+                f"* {kwargs['sender']} offers {kwargs['name']} "
+                f"({_format_bytes(kwargs['size'])}) — receiving…"
+            )
+        elif kind == "file-progress":
+            # Percentages would flood a line-based terminal; only milestones print.
+            percent = int(kwargs["received"] * 100 / max(kwargs["size"], 1))
+            if percent % 25 == 0:
+                self._print(f"  … {kwargs['name']} {percent}%")
+        elif kind == "file-sent":
+            accepted = kwargs["accepted"]
+            total = kwargs["total"]
+            if accepted == 0:
+                self._print(f"! nobody accepted {kwargs['name']}")
+            else:
+                self._print(
+                    f"* sent {kwargs['name']} to {accepted} of {total} "
+                    f"{'peer' if total == 1 else 'peers'}"
+                )
+        elif kind == "file-received":
+            self._print(
+                f"* received {kwargs['name']} ({_format_bytes(kwargs['size'])}) "
+                f"from {kwargs['sender']} → {kwargs['target']}"
+            )
+        elif kind == "file-cancelled-out":
+            self._print(f"* cancelled sending {kwargs['name']}")
+        elif kind == "file-error":
+            self._print(f"! {kwargs['text']}")
+
+    @staticmethod
+    def _stamp(ts):
+        seconds = (ts / 1000) if isinstance(ts, (int, float)) and ts > 10_000_000_000 else time.time()
+        return time.strftime("%H:%M", time.localtime(seconds))
 
     def _print(self, line):
         with self.lock:
@@ -228,8 +359,8 @@ class ChatApp:
             self._print("  waiting for people on this network... (ctrl+c to quit, /help)")
 
         if self.connect_to:
-            address, _, port_text = self.connect_to.partition(":")
-            self.chat.connect_to(address, int(port_text or 45913))
+            address, port_text = split_host_port(self.connect_to)
+            self.chat.connect_to(address, int(port_text) if port_text else 45913)
 
         threading.Thread(target=self._dial_loop, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -275,10 +406,17 @@ class ChatApp:
             self.run_command(line)
             return
 
-        if not self.chat.peer_ids:
-            self._print("! nobody is connected yet; waiting for the network...")
-            return
+        # Always send: when nobody is reachable the client queues the message
+        # (and echoes it locally), instead of swallowing what the user typed.
         self.chat.send_chat(line)
+
+    def _find_peer(self, ref):
+        """Resolve a username (or client id) to a connected client id."""
+        wanted = ref.lstrip("@").strip().lower()
+        for client_id, username in self.chat.peer_name_map().items():
+            if username.lower() == wanted or client_id.lower() == wanted:
+                return client_id
+        return None
 
     def run_command(self, line):
         parts = line[1:].split(maxsplit=1)
@@ -287,8 +425,10 @@ class ChatApp:
 
         if command in ("help", "h", "?"):
             self._print(
-                "commands: /rooms /users /me <action> /join <room> /name <username> "
-                "/connect <ip[:port]> /status /quit"
+            "commands: /rooms /users /me <action> /join <room> /name <username> "
+            "/connect <ip[:port]> /reply <id> <text> /react <id> <emoji> "
+            "/ids /file <path> /file cancel [id] /identity /fingerprint <user> "
+            "/trust <user> /untrust <user> /status /quit"
             )
         elif command == "rooms":
             rooms = self.discovery.live_rooms() if self.discovery else {}
@@ -303,8 +443,12 @@ class ChatApp:
                 for peer in self.discovery.live_peers():
                     room = f"  #{peer.room}" if peer.room else ""
                     self._print(f"  {peer.username}{room}")
+            names = self.chat.peer_name_map()
+            rooms = self.chat.peer_rooms()
             for client_id in self.chat.peer_ids:
-                self._print(f"  {client_id} (connected)")
+                name = names.get(client_id, "?")
+                where = f" #{rooms[client_id]}" if rooms.get(client_id) else ""
+                self._print(f"  {name}{where} (connected)")
         elif command == "join":
             room = sanitize_room_name(argument)
             if not room:
@@ -313,6 +457,10 @@ class ChatApp:
             self.room = room
             if self.discovery is not None:
                 self.discovery.set_state(self.username, room, self.chat.port)
+            # Tell every live peer our room changed: their broadcast filter is
+            # keyed off our last HELLO/JOIN frame, and without this every
+            # later message in the new room black-holed on their side.
+            self.chat.announce_identity()
             self._print(f"* joined #{room}")
         elif command == "name":
             name = sanitize_username(argument)
@@ -320,29 +468,126 @@ class ChatApp:
                 self._print("! usage: /name <username>")
                 return
             self.username = name
+            # The wire client stamps its own username on every envelope (and
+            # HELLO), so it must be updated too — otherwise /name changes the
+            # local prompt only and peers keep seeing the old name.
+            self.chat.username = name
             if self.discovery is not None:
                 self.discovery.set_state(name, self.room, self.chat.port)
+            self.chat.announce_identity()
             self._print(f"* you are now {name}")
         elif command == "connect":
-            address, _, port_text = argument.partition(":")
-            if not address:
-                self._print("! usage: /connect <ip[:port]>")
+            address, port_text = split_host_port(argument)
+            if not address or not is_valid_host(address):
+                self._print("! usage: /connect <host[:port]>  ·  IPv6 as [::1]:45913")
+                return
+            try:
+                port = int(port_text) if port_text else 45913
+            except ValueError:
+                self._print("! the port must be a number, e.g. /connect 192.168.1.24:45913")
+                return
+            if not 1 <= port <= 65535:
+                self._print("! the port must be between 1 and 65535")
                 return
             threading.Thread(
                 target=self.chat.connect_to,
-                args=(address, int(port_text or 45913)),
+                args=(address, port),
                 daemon=True,
             ).start()
         elif command == "me":
             if not argument:
                 self._print("! usage: /me <action>")
                 return
-            if not self.chat.peer_ids:
-                self._print("! nobody is connected yet; waiting for the network...")
-                return
+            # The message-sent event echoes locally (and queues when nobody
+            # is reachable), so there is no manual print here — it would
+            # double up on the echo.
             self.chat.send_action(argument)
-            self._print(f"* {self.username} {argument.strip()}")
+        elif command == "reply":
+            target, _, body = argument.partition(" ")
+            body = body.strip()
+            if not _valid_ref(target) or not body:
+                self._print("! usage: /reply <id|prefix> <text>")
+                return
+            if self.chat.send_reply(target, body) is None:
+                self._print("! that reply could not be sent (invalid id or text)")
+        elif command == "react":
+            target, _, emoji = argument.partition(" ")
+            emoji = emoji.strip()
+            if not _valid_ref(target) or emoji not in REACTION_SET:
+                self._print(
+                    f"! usage: /react <id|prefix> <{'|'.join(REACTION_SET[:4])}|...>"
+                )
+                return
+            if self.chat.send_reaction(target, emoji) is None:
+                self._print("! that reaction could not be sent (invalid id or emoji)")
+        elif command == "file":
+            # `/file cancel [id]` aborts active transfers (all of them without an id).
+            parts = argument.split()
+            if not parts:
+                self._print("! usage: /file <file-path>  ·  /file cancel [id]")
+                return
+            if parts[0] == "cancel":
+                ok, error = self.chat.cancel_transfer(parts[1] if len(parts) > 1 else None)
+            else:
+                ok, error = self.chat.offer_file(argument)
+            if not ok:
+                self._print(f"! {error}")
+        elif command == "identity":
+            self._print(f"  your identity fingerprint: {identity_key_id(self.chat.identity_seed)}")
+            self._print("  share it with a peer (or run /fingerprint on their side) to verify the link")
+        elif command == "fingerprint":
+            if not argument:
+                self._print("! usage: /fingerprint <username>")
+                return
+            client_id = self._find_peer(argument)
+            if client_id is None:
+                self._print(f'! no peer named "{argument}"')
+                return
+            key_id = self.chat.peer_fingerprint(client_id)
+            if key_id is None:
+                username = self.chat.peer_name_map().get(client_id, argument)
+                self._print(f"! {username} has not completed a handshake yet — no key to show")
+                return
+            username = self.chat.peer_name_map().get(client_id, argument)
+            self._print(f"  {username}  {client_id}")
+            self._print(f"    key {key_id}")
+        elif command in ("trust", "untrust"):
+            if not argument:
+                self._print(f"! usage: /{command} <username>")
+                return
+            client_id = self._find_peer(argument)
+            if client_id is None:
+                self._print(f'! no peer named "{argument}"')
+                return
+            username = self.chat.peer_name_map().get(client_id, argument)
+            if command == "trust":
+                key_id = self.chat.peer_fingerprint(client_id)
+                if key_id is None:
+                    self._print(f"! {username} has not completed a handshake yet — no key to trust")
+                    return
+                self.pin_store.trust(client_id, key_id)
+                self._save_pins(self.pin_store.to_config())
+                self._print(f"  pinned {username}'s current key")
+            else:
+                if not self.pin_store.untrust(client_id):
+                    self._print(f"! {username} had no pinned key")
+                    return
+                self._save_pins(self.pin_store.to_config())
+                self._print(f"  forgot {username}'s pinned key")
+        elif command == "ids":
+            # Ids are never rendered inline; this is where /reply and /react
+            # targets come from (same workflow as the npm TUI).
+            entries = [entry for entry in self._recent if entry[1] == self.room]
+            if not entries:
+                self._print(
+                    f"  no messages in #{self.room} yet — ids will list here "
+                    "for /reply and /react"
+                )
+                return
+            for message_id, _room, who, preview in reversed(entries[-20:]):
+                self._print(f"  {message_id}  {who}: {preview}")
         elif command == "status":
+            self._print(f"  you: {self.username} in #{self.room}")
             discovery = self.discovery
             if discovery is None:
                 self._print("  discovery: off")
@@ -357,6 +602,10 @@ class ChatApp:
             unencrypted = [cid for cid, mode in modes.items() if mode != "secure"]
             if unencrypted:
                 self._print(f"  WARNING: {len(unencrypted)} link(s) without encryption")
+            queued = self.chat.offline_count()
+            if queued:
+                self._print(f"  queued: {queued} message{'s' if queued != 1 else ''} waiting for a peer")
+            self._print(f"  identity: {self.chat.identity_fingerprint()}")
         elif command in ("quit", "q", "exit"):
             raise KeyboardInterrupt
         else:
@@ -364,6 +613,16 @@ class ChatApp:
 
 
 def main(argv=None):
+    # Windows consoles default to a legacy code page (cp1252); printing a
+    # status arrow from a reader thread then raises UnicodeEncodeError and
+    # kills that thread, silently blackholing every later frame. Force UTF-8
+    # with lossy replacement instead: ugly output never beats a dead link.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     parser = argparse.ArgumentParser(
         prog="zapchat",
         description="Terminal-native LAN chat. No accounts, no cloud, no servers.",

@@ -67,6 +67,8 @@ export function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     members: [],
     messages: [],
     notice: null,
+    transfers: [],
+    queued: [],
     status: makeStatus(),
     ...overrides,
   };

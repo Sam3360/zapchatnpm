@@ -33,9 +33,58 @@ MAX_UDP_PACKET_BYTES = 1100
 MAX_FRAME_BYTES = 8 * 1024
 MAX_CLOCK_SKEW_MS = 10 * 60 * 1000
 
+# ------------------------------------------------------------- v8 additions
+# Mirrors of src/protocol/constants.ts; keep the two stacks in sync or
+# npm<->Py transfers and reactions silently misbehave.
+
+# Longest reaction emoji/text accepted on the wire (characters).
+MAX_REACTION_CHARS = 16
+
+# Reactions must come from this set — no free-form text, no zero-width junk.
+REACTION_SET = (
+    "👍", "👎", "❤", "😂", "😮", "😢", "🎉", "🔥",
+    "+1", "-1", "lol", "ok", "wow", "hm",
+)
+
+# Message ids may be given as a unique prefix of at least this length.
+MIN_ID_PREFIX_CHARS = 4
+
+# Largest file we will offer or accept, in bytes.
+MAX_FILE_BYTES = 64 * 1024 * 1024
+
+# Raw bytes per FILE_CHUNK payload (base64 must keep the frame under 8 KiB).
+FILE_CHUNK_BYTES = 4096
+
+# Upper bound on chunk indices we accept (derived from the size cap).
+MAX_FILE_CHUNKS = -(-MAX_FILE_BYTES // FILE_CHUNK_BYTES)
+
+# Longest received file name (after sanitisation), in characters.
+MAX_FILE_NAME_CHARS = 120
+
+# Simultaneous transfers (in + out) per client.
+MAX_ACTIVE_TRANSFERS = 8
+
+# An incoming transfer with no chunks for this long expires and is deleted.
+TRANSFER_IDLE_TIMEOUT_MS = 60 * 1000
+
+# Subdirectory of the OS temp dir where received files land.
+RECEIVED_FILES_DIR = 'zapchat-received'
+
+# How many messages the offline queue buffers per client while disconnected.
+OFFLINE_QUEUE_LIMIT = 100
+
+# Queued messages older than this are dropped (temporary by design).
+OFFLINE_QUEUE_TTL_MS = 10 * 60 * 1000
+
 MESSAGE_TYPES = {
     "HELLO", "ANNOUNCE", "ROOM_LIST", "PEER_LIST",
     "JOIN", "LEAVE", "MESSAGE", "PING", "PONG",
+    # ---- v8: additive types. Older peers drop unknown types at parse time
+    # ---- (parse_envelope returns None), exactly as v1 peers drop v2 frames:
+    # ---- no crash, no misparse, full interop in both directions.
+    "REPLY", "REACTION",
+    "FILE_OFFER", "FILE_ACCEPT", "FILE_REJECT", "FILE_CHUNK",
+    "FILE_COMPLETE", "FILE_CANCEL",
 }
 
 ENVELOPE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -95,14 +144,118 @@ def is_valid_client_id(value):
     return isinstance(value, str) and CLIENT_ID_PATTERN.match(value) is not None
 
 
+_IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_ZONE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def is_valid_ipv4(value):
+    """True for a dotted quad whose octets are all 0-255."""
+    if not isinstance(value, str) or not _IPV4_RE.match(value):
+        return False
+    return all(0 <= int(part) <= 255 for part in value.split("."))
+
+
+def is_valid_ipv6(value):
+    """True for an IPv6 literal, optionally with a zone id (`fe80::1%eth0`).
+
+    The npm mirror of this lives in `src/protocol/sanitize.ts`. Up to eight
+    groups of 1-4 hex digits, at most one `::` elision, and an optional
+    trailing IPv4 quad (which counts as the last two groups).
+    """
+    if not isinstance(value, str) or not value or len(value) > 45:
+        return False
+
+    address = value
+    zone_at = address.find("%")
+    if zone_at != -1:
+        zone = address[zone_at + 1:]
+        address = address[:zone_at]
+        if not _ZONE_RE.match(zone):
+            return False
+
+    if not address or ":" not in address:
+        return False
+
+    parts = address.split("::")
+    if len(parts) > 2:
+        return False
+
+    head = parts[0].split(":") if parts[0] else []
+    tail = parts[1].split(":") if len(parts) == 2 and parts[1] else []
+    groups = 0
+    all_groups = head + tail
+
+    for index, group in enumerate(all_groups):
+        if "." in group:
+            # A trailing IPv4 quad stands in for the last two groups.
+            if index != len(all_groups) - 1 or not is_valid_ipv4(group):
+                return False
+            groups += 2
+            continue
+        if not re.fullmatch(r"[0-9A-Fa-f]{1,4}", group):
+            return False
+        groups += 1
+
+    return groups <= 8 if len(parts) == 2 else groups == 8
+
+
+def is_valid_host(value):
+    """True for a hostname, IPv4 literal or IPv6 literal (no port)."""
+    if not isinstance(value, str) or not value or len(value) > 253:
+        return False
+
+    if ":" in value:
+        return is_valid_ipv6(value)
+
+    if " " in value or "/" in value:
+        return False
+
+    if re.fullmatch(r"\d+(?:\.\d+)*", value):
+        return is_valid_ipv4(value)
+
+    return re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", value) is not None
+
+
+def split_host_port(value):
+    """Split `host`, `host:port` or `[ipv6]:port` into (host, port-or-None).
+
+    An unbracketed value with more than one colon is a bare IPv6 literal: its
+    last group is an address part, not a port.
+    """
+    trimmed = (value or "").strip()
+
+    if trimmed.startswith("["):
+        end = trimmed.find("]")
+        if end != -1:
+            host = trimmed[1:end]
+            rest = trimmed[end + 1:]
+            return (host, rest[1:] if rest.startswith(":") else None)
+        return (trimmed, None)
+
+    separator = trimmed.rfind(":")
+    if separator == -1:
+        return (trimmed, None)
+    if trimmed.find(":") != separator:
+        return (trimmed, None)
+
+    return (trimmed[:separator], trimmed[separator + 1:])
+
+
 def sanitize_address_list(value, max_addresses=8):
-    """Keep well-formed IPv4 strings, drop everything else."""
+    """Keep well-formed IPv4/IPv6 strings, drop everything else."""
     if not isinstance(value, list):
         return []
     kept = []
     for entry in value[: max_addresses * 2]:
-        if isinstance(entry, str) and re.match(r"^(\d{1,3}\.){3}\d{1,3}$", entry):
+        if not isinstance(entry, str):
+            if len(kept) >= max_addresses:
+                break
+            continue
+        if is_valid_ipv4(entry):
             kept.append(entry)
+        elif is_valid_ipv6(entry):
+            # Never advertise a zone id: it is local to this machine.
+            kept.append(entry.split("%")[0])
         if len(kept) >= max_addresses:
             break
     return kept
@@ -244,6 +397,118 @@ def parse_message_data(data):
 
     cleaned = CONTROL_CHARS.sub("", ANSI_SEQUENCES.sub("", text)).strip()[:MAX_MESSAGE_CHARS]
     return cleaned or None
+
+
+# ------------------------------------------------------------ v8 payloads
+# Wire keys are camelCase on both stacks so npm<->Py stays symmetric.
+
+
+def parse_message_ref(value):
+    """A message-id reference (reply/reaction target): full id or prefix."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not MIN_ID_PREFIX_CHARS <= len(trimmed) <= 64:
+        return None
+    if not re.match(r"^[A-Za-z0-9_-]+$", trimmed):
+        return None
+    return trimmed
+
+
+def parse_reply_data(data):
+    """Validate a REPLY payload; returns (text, reply_to) or (None, None)."""
+    if not isinstance(data, dict):
+        return None, None
+    reply_to = parse_message_ref(data.get("replyTo"))
+    if reply_to is None:
+        return None, None
+    text = data.get("text")
+    if not isinstance(text, str) or len(text) > MAX_MESSAGE_CHARS * 4:
+        return None, None
+    if is_action_message(text):
+        body = sanitize_text(action_body(text), MAX_MESSAGE_CHARS)
+        if not body:
+            return None, None
+        return _ACTION_PREFIX + body + _ACTION_SUFFIX, reply_to
+    cleaned = CONTROL_CHARS.sub("", ANSI_SEQUENCES.sub("", text)).strip()[:MAX_MESSAGE_CHARS]
+    return (cleaned or None), reply_to
+
+
+def parse_reaction_data(data):
+    """Validate a REACTION payload; returns (target, reaction) or (None, None)."""
+    if not isinstance(data, dict):
+        return None, None
+    target = parse_message_ref(data.get("target"))
+    reaction = data.get("reaction")
+    if target is None or not isinstance(reaction, str):
+        return None, None
+    if len(reaction) > MAX_REACTION_CHARS:
+        return None, None
+    return (target, reaction) if reaction in REACTION_SET else (None, None)
+
+
+def _parse_transfer_id(value):
+    if not isinstance(value, str):
+        return None
+    if 8 <= len(value) <= 64 and re.match(r"^[A-Za-z0-9_-]+$", value):
+        return value
+    return None
+
+
+def parse_file_offer_data(data):
+    """Validate a FILE_OFFER payload, or None.
+
+    Names are display-only and must never carry path parts (path traversal):
+    only the final bare component survives.
+    """
+    if not isinstance(data, dict):
+        return None
+    transfer_id = _parse_transfer_id(data.get("transferId"))
+    size = data.get("size")
+    if transfer_id is None:
+        return None
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or size > MAX_FILE_BYTES:
+        return None
+    raw_name = data.get("name")
+    raw_name = raw_name if isinstance(raw_name, str) else ""
+    bare = raw_name.replace("\\", "/").split("/")[-1]
+    name = CONTROL_CHARS.sub("", ANSI_SEQUENCES.sub("", bare)).strip()[:MAX_FILE_NAME_CHARS]
+    if not name or name in (".", ".."):
+        return None
+    mime = data.get("mime")
+    if not isinstance(mime, str) or not mime or len(mime) > 64:
+        mime = None
+    else:
+        mime = CONTROL_CHARS.sub("", ANSI_SEQUENCES.sub("", mime)).strip()[:64] or None
+    return {"transferId": transfer_id, "name": name, "size": size, "mime": mime}
+
+
+def parse_file_chunk_data(data):
+    """Validate a FILE_CHUNK payload, or None. Size-capped before decode."""
+    if not isinstance(data, dict):
+        return None
+    transfer_id = _parse_transfer_id(data.get("transferId"))
+    index = data.get("index")
+    if transfer_id is None:
+        return None
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= MAX_FILE_CHUNKS:
+        return None
+    encoded = data.get("data")
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    if len(encoded) > (FILE_CHUNK_BYTES + 2) // 3 * 4 + 8:
+        return None
+    if not re.match(r"^[A-Za-z0-9+/]+={0,2}$", encoded):
+        return None
+    return {"transferId": transfer_id, "index": index, "data": encoded}
+
+
+def parse_transfer_id_data(data):
+    """Validate FILE_ACCEPT/REJECT/COMPLETE/CANCEL payloads (id only)."""
+    if not isinstance(data, dict):
+        return None
+    transfer_id = _parse_transfer_id(data.get("transferId"))
+    return None if transfer_id is None else {"transferId": transfer_id}
 
 
 def parse_announce_data(data):

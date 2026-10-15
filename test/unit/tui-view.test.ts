@@ -231,6 +231,38 @@ describe('timeline', () => {
   it('returns nothing for a zero-width terminal instead of throwing', () => {
     assert.deepEqual(buildTimeline([makeMessage()], 0, { selfName: 'me' }), []);
   });
+
+  it('renders a reply with a quote marker naming the original author', () => {
+    const lines = buildTimeline(
+      [
+        makeMessage({ id: 'abc123', username: 'sam', text: 'original', from: 'zc-sam' }),
+        makeMessage({ id: 'def456', username: 'me', text: 'agreed', self: true, replyTo: 'abc1' }),
+      ],
+      80,
+      { selfName: 'me' },
+    );
+
+    const reply = lines.find(line => line.spans.some(span => span.text.includes('agreed')));
+    assert.ok(reply, 'the reply line is present');
+    const text = reply.spans.map(span => span.text).join('');
+    assert.ok(text.includes('↩ sam:'), `expected a quote marker, got ${text}`);
+    assert.ok(displayWidth(text) <= 80);
+  });
+
+  it('renders a reaction as a compact dim aside', () => {
+    const lines = buildTimeline(
+      [makeMessage({ id: 'r1', username: 'sam', text: '', reaction: '👍', replyTo: 'abc1', from: 'zc-sam' })],
+      80,
+      { selfName: 'me' },
+    );
+
+    assert.equal(lines.length, 1);
+    const text = lines[0]?.spans.map(span => span.text).join('') ?? '';
+    assert.ok(text.includes('👍'));
+    assert.ok(text.includes('sam'));
+    assert.ok(text.includes('reacted'));
+    assert.ok(lines[0]?.spans.some(span => span.dim === true));
+  });
 });
 
 describe('viewport slicing', () => {

@@ -188,4 +188,47 @@ describe('runCommand', () => {
       assert.deepEqual(client.getSnapshot().messages, []);
     });
   });
+
+  it('lists no ids before any chat message exists', async () => {
+    await withClient(async (client, print, output) => {
+      runCommand(parseCommand('/join general')!, { client, print });
+      client.systemMessage('a system note is not chat');
+
+      runCommand(parseCommand('/ids')!, { client, print });
+
+      assert.match(output.join('\n'), /no messages in this room yet/);
+    });
+  });
+
+  it('lists recent message ids and lets you reply with a prefix', async () => {
+    await withClient(async (client, print, output) => {
+      runCommand(parseCommand('/join general')!, { client, print });
+      const sent = client.send('echo check 123');
+      assert.equal(sent.ok, true);
+
+      runCommand(parseCommand('/ids')!, { client, print });
+
+      const text = output.join('\n');
+      assert.match(text, /tester: echo check 123/);
+
+      // The listed id must be the real target usable by /reply.
+      const listed = text.match(/([A-Za-z0-9_-]{8,64})\s+tester: echo check 123/);
+      assert.ok(listed, '/ids prints the message id');
+
+      output.length = 0;
+      runCommand(parseCommand(`/reply ${listed[1]} got it`)!, { client, print });
+      assert.equal(client.getSnapshot().messages.some(m => m.text.includes('got it')), true);
+    });
+  });
+
+  it('explains usage when /reply or /react is malformed', async () => {
+    await withClient(async (client, print, output) => {
+      runCommand(parseCommand('/reply no-target-text')!, { client, print });
+      runCommand(parseCommand('/react')!, { client, print });
+
+      const text = output.join('\n');
+      assert.match(text, /usage: \/reply/);
+      assert.match(text, /usage: \/react/);
+    });
+  });
 });

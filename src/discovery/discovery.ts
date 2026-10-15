@@ -164,8 +164,30 @@ export class DiscoveryService {
         }
       };
 
-      socket.on('error', error => {
-        const detail = explainSocketError(error, this.#port);
+      // Python clients bind the same well-known port and may hold it first;
+      // on Windows the second bind can even surface as EACCES. Losing the
+      // shared port must not kill discovery: multicast membership still
+      // delivers group traffic regardless of bind port (the Python client
+      // already behaves like this). Fall back to an ephemeral port once.
+      let fallback = false;
+      socket.on('error', (error: NodeJS.ErrnoException) => {
+        if (!fallback && !this.#state.listening && (error.code === 'EADDRINUSE' || error.code === 'EACCES')) {
+          fallback = true;
+          socket.removeAllListeners('error');
+          socket.removeAllListeners('listening');
+          socket.close();
+
+          const retry = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+          this.#socket = retry;
+          this.#bindAndListen(
+            retry,
+            { bindPort: 0, bindWarning: 'another instance holds the discovery port; using multicast' },
+            settle,
+          );
+          return;
+        }
+
+        const detail = explainSocketError(error as Error, this.#port);
         this.#state = {
           ...this.#state,
           kind: 'unavailable',
@@ -180,54 +202,110 @@ export class DiscoveryService {
         this.#handleDatagram(message, remote);
       });
 
-      socket.on('listening', () => {
-        const warnings: string[] = [];
+    this.#bindAndListen(socket, { bindPort: this.#port, bindWarning: null }, settle);
+    });
+  }
 
-        try {
-          socket.setBroadcast(true);
-          this.#state = { ...this.#state, broadcast: true };
-        } catch (error) {
-          warnings.push(`broadcast unavailable (${(error as Error).message})`);
-        }
+  /**
+   * Bind `socket` and wire the shared listening/setup path.
+   *
+   * `bindPort` 0 picks an ephemeral port — the deliberate fallback when the
+   * well-known port is lost: on Windows a second bind of the shared port
+   * fails outright (EACCES even with SO_REUSEADDR), but multicast membership
+   * still delivers group traffic regardless of which instance holds the
+   * well-known port.
+   */
+  #bindAndListen(socket: Socket, bind: { bindPort: number; bindWarning: string | null }, settle: () => void): void {
+    socket.on('error', error => {
+      const detail = explainSocketError(error as Error, this.#port);
+      this.#state = {
+        ...this.#state,
+        kind: 'unavailable',
+        listening: false,
+        detail,
+      };
+      this.#options.onError?.(error as Error);
+      settle();
+    });
 
-        const multicast = this.#joinMulticast(socket, warnings);
-        if (multicast) {
-          try {
-            socket.setMulticastTTL(1);
-            socket.setMulticastLoopback(true);
-          } catch {
-            warnings.push('could not configure multicast TTL');
-          }
-        }
+    socket.on('message', (message, remote) => {
+      this.#handleDatagram(message, remote);
+    });
 
-        this.#state = {
-          ...this.#state,
-          kind: warnings.length === 0 ? 'ok' : 'degraded',
-          listening: true,
-          multicast,
-          detail:
-            warnings.length === 0
-              ? `listening on udp:${this.#port}`
-              : warnings.join('; '),
-        };
-
-        this.#startTimer();
-        this.announceNow();
-        settle();
-      });
+    socket.on('listening', () => {
+      const warnings: string[] = [];
+      if (bind.bindWarning !== null) {
+        warnings.push(bind.bindWarning);
+      }
 
       try {
-        socket.bind({ port: this.#port, address: '0.0.0.0', exclusive: false });
+        socket.setBroadcast(true);
+        this.#state = { ...this.#state, broadcast: true };
       } catch (error) {
-        this.#state = {
-          ...this.#state,
-          kind: 'unavailable',
-          listening: false,
-          detail: explainSocketError(error as Error, this.#port),
-        };
-        settle();
+        warnings.push(`broadcast unavailable (${(error as Error).message})`);
       }
+
+      const multicast = this.#joinMulticast(socket, warnings);
+      if (multicast) {
+        try {
+          socket.setMulticastTTL(1);
+          socket.setMulticastLoopback(true);
+        } catch {
+          warnings.push('could not configure multicast TTL');
+        }
+      }
+
+      this.#state = {
+        ...this.#state,
+        kind: bind.bindWarning !== null || warnings.length > 0 ? 'degraded' : 'ok',
+        listening: true,
+        multicast,
+        detail:
+          bind.bindWarning !== null && warnings.length > 1
+            ? warnings.join('; ')
+            : warnings[0] ?? `listening on udp:${this.#port}`,
+      };
+
+      this.#startTimer();
+      this.announceNow();
+      settle();
     });
+
+    try {
+      socket.bind({ port: bind.bindPort, address: '0.0.0.0', exclusive: false });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (bind.bindPort !== 0 && (code === 'EADDRINUSE' || code === 'EACCES')) {
+        // Same fallback as the async path: an ephemeral port still receives
+        // multicast group traffic, so discovery survives a lost well-known port.
+        this.#bindAndListen(
+          socket,
+          { bindPort: 0, bindWarning: 'another instance holds the discovery port; using multicast' },
+          settle,
+        );
+        try {
+          socket.bind({ port: 0, address: '0.0.0.0', exclusive: false });
+        } catch {
+          this.#state = {
+            ...this.#state,
+            kind: 'unavailable',
+            listening: false,
+            detail: explainSocketError(error as Error, this.#port),
+          };
+          settle();
+        }
+        return;
+      }
+
+      // Synchronous bind failure (rare): report it like an async one.
+      this.#state = {
+        ...this.#state,
+        kind: 'unavailable',
+        listening: false,
+        detail: explainSocketError(error as Error, this.#port),
+      };
+      settle();
+    }
   }
 
   /** Join the multicast group on every usable interface. */
@@ -301,7 +379,12 @@ export class DiscoveryService {
         continue;
       }
 
-      for (const version of SUPPORTED_WIRE_VERSIONS) {
+      // Newest version first: a receiver creates its peer record from the
+      // first packet it sees, and a record created as v1 makes both sides
+      // refuse to dial until the v2 packet lands — which stalls
+      // discovery-made links on lossy networks. The receiver's
+      // never-downgrade Math.max makes the trailing v1 packet harmless.
+      for (const version of [...SUPPORTED_WIRE_VERSIONS].reverse()) {
         const packet = buildBeacon(
           { clientId: this.#clientId, username: snapshot.username, room: snapshot.room },
           announceData,
@@ -340,9 +423,10 @@ export class DiscoveryService {
     // One beacon per supported wire version. v1 peers (the Python client) can
     // only parse v:1 envelopes and v2-only peers (npm 2.x-4.x) only v:2, so a
     // single-version beacon hides us from the other stack entirely. The
-    // packets are byte-identical except for the `v` field.
+    // packets are byte-identical except for the `v` field. Newest first so a
+    // receiver never creates its peer record as legacy (see the unicast loop).
     const packets: Buffer[] = [];
-    for (const version of SUPPORTED_WIRE_VERSIONS) {
+    for (const version of [...SUPPORTED_WIRE_VERSIONS].reverse()) {
       const packet = buildBeacon(
         // The room travels in the envelope, so receivers learn where to find us
         // from the beacon itself rather than waiting for a TCP handshake.

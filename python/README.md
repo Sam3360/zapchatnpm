@@ -51,6 +51,14 @@ zapchat 6.0.0 — LAN chat, no accounts, no server
 | `/join <room>` | Join a room (created if nobody is in it) |
 | `/name <username>` | Change your display name |
 | `/me <action>` | Send an action message: `/me waves` → `* sam waves` |
+| `/ids` | Recent message ids — targets for `/reply` and `/react` |
+| `/reply <id> <text>` | Reply to a message (quoted visually); an id prefix works |
+| `/react <id> <emoji>` | React to a message with 👍 👎 ❤️ 😂 😮 😢 or a plain word |
+| `/file <path>` | Send a file to the room; `/file cancel [id]` aborts |
+| `/identity` | This install's long-term identity fingerprint |
+| `/fingerprint <name>` | A peer's identity key fingerprint |
+| `/trust <name>` | Pin a peer's identity key |
+| `/untrust <name>` | Forget a pinned key |
 | `/connect <ip[:port]>` | Connect straight to a peer when discovery is blocked |
 | `/status` | Discovery state, ports, peers |
 | `/quit` | Exit |

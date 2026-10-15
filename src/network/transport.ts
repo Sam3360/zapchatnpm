@@ -244,6 +244,17 @@ export class TcpTransport {
     return this.#byClientId.has(clientId);
   }
 
+  /**
+   * Bytes queued but not yet flushed to the kernel for this peer's socket.
+   * File chunk senders use this to pace themselves: the transport drops a peer
+   * whose buffer passes MAX_PENDING_WRITE_BYTES, so a fast sender must wait
+   * for the OS to catch up instead of racing into the drop threshold.
+   * Returns 0 when the peer is not connected.
+   */
+  pendingBytes(clientId: string): number {
+    return this.#byClientId.get(clientId)?.socket.writableLength ?? 0;
+  }
+
   getPeer(clientId: string): PeerHandle | undefined {
     return this.#byClientId.get(clientId)?.peer ?? undefined;
   }

@@ -4,7 +4,7 @@ Same rules as the npm TUI's `src/tui/completion.ts`:
 
     /jo<Tab>            -> command names (first word only, "/" required)
     /me waves sa<Tab>   -> later words complete room-member usernames (@ optional)
-    /join ge<Tab>       -> room names for /join and /create (# optional)
+    /join ge<Tab>       -> room names for /join (# optional)
 
 `completions_for` is pure and unit tested; `TabCompleter` adapts it to the
 `readline` module (stdlib on POSIX, optional on Windows). Matching is
@@ -21,12 +21,24 @@ COMMANDS = (
     "name",
     "connect",
     "me",
+    "reply",
+    "react",
+    "ids",
+    "file",
+    "identity",
+    "fingerprint",
+    "trust",
+    "untrust",
     "status",
     "quit", "q", "exit",
 )
 
 # Commands whose argument is a room name.
 ROOM_ARG_COMMANDS = {"join"}
+
+# First argument is a message id/unique prefix, the second is free text. We only
+# complete usernames on the *third+* word so the id itself stays as typed.
+REPLY_REACTION_ARGS_COMMANDS = {"reply", "react"}
 
 COMMAND_WORDS = tuple(sorted(set(COMMANDS)))
 
@@ -61,6 +73,12 @@ def completions_for(text, members=(), rooms=()):
             return []
         prefix = "#" if last_word.startswith("#") else ""
         return [prefix + room for room in rooms if room.lower().startswith(needle)]
+
+    if command in REPLY_REACTION_ARGS_COMMANDS:
+        # /reply <id> <text...> and /react <id> <emoji>: the id is word 2, so
+        # usernames only start completing from word 3 onwards.
+        if len(stripped.split(" ")) < 3:
+            return []
 
     needle = last_word.lstrip("@").lower()
     if not needle:

@@ -35,6 +35,45 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: 'connect directly to a peer when discovery is blocked',
   },
   { name: 'status', summary: 'discovery, ports and connection details' },
+  {
+    name: 'ids',
+    summary: 'list recent message ids — targets for /reply and /react',
+  },
+  {
+    name: 'reply',
+    args: '<id|prefix> <text>',
+    summary: 'reply to a message (quote it visually)',
+  },
+  {
+    name: 'react',
+    args: '<id|prefix> <reaction>',
+    summary: 'react to a message with an emoji from the allowed set',
+    aliases: ['reaction'],
+  },
+  {
+    name: 'file',
+    args: '<file-path|cancel [id]>',
+    summary: 'offer a file to everyone in this room (cancel aborts transfers)',
+  },
+  {
+    name: 'identity',
+    summary: 'your long-term key fingerprint (share it to verify a peer)',
+  },
+  {
+    name: 'fingerprint',
+    args: '<username>',
+    summary: 'show a peer\'s key fingerprint to compare out of band',
+  },
+  {
+    name: 'trust',
+    args: '<username>',
+    summary: 'accept a peer\'s current key (after their reinstall)',
+  },
+  {
+    name: 'untrust',
+    args: '<username>',
+    summary: 'forget a peer\'s pinned key',
+  },
   { name: 'quit', summary: 'exit zapchat', aliases: ['q', 'exit'] },
 ] as const;
 

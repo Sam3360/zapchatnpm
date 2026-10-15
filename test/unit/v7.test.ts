@@ -161,3 +161,39 @@ describe('tab completion — editing behaviour', () => {
     assert.deepEqual(result.matches, []);
   });
 });
+
+describe('tab completion — v8 reply/reaction/file commands', () => {
+  const members = ['sam', 'sasha'];
+
+  it('completes the new command names', () => {
+    const file = completeInput('/fi', ctx(), { matchIndex: 0 });
+    assert.equal(file.text, '/file');
+
+    const reply = completeInput('/re', ctx(), { matchIndex: 0 });
+    assert.deepEqual(reply.matches, ['react', 'reaction', 'reply']);
+  });
+
+  it('leaves the message-id argument of /reply and /react alone', () => {
+    for (const command of ['/reply', '/react']) {
+      const result = completeInput(`${command} sam`, ctx({ members }), { matchIndex: 0 });
+      assert.equal(result.text, `${command} sam`);
+      assert.deepEqual(result.matches, []);
+    }
+  });
+
+  it('completes usernames from the third word on', () => {
+    const result = completeInput('/react abcd1234 sa', ctx({ members }), { matchIndex: 0 });
+    assert.equal(result.text, '/react abcd1234 sam');
+    assert.deepEqual(result.matches, ['sam', 'sasha']);
+  });
+
+  it('keeps the @ prefix when completing a reply body', () => {
+    const result = completeInput('/reply abcd1234 @sa', ctx({ members }), { matchIndex: 0 });
+    assert.equal(result.text, '/reply abcd1234 @sam');
+  });
+
+  it('never offers room names as a file path', () => {
+    const result = completeInput('/file gen', ctx({ rooms: ['general'] }), { matchIndex: 0 });
+    assert.deepEqual(result.matches, []);
+  });
+});

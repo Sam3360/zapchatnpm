@@ -247,6 +247,23 @@ describe('history', () => {
     assert.deepEqual(registry.history('general'), []);
     assert.equal(registry.historyRoomCount, 0);
   });
+
+  it('returns a fresh array so React dependencies see new messages', () => {
+    // Regression: `history()` used to hand back the live, mutated bucket. The
+    // snapshot's `messages` reference therefore never changed and the TUI's
+    // `useMemo` skipped rebuilding the timeline — messages only appeared after
+    // a terminal resize. Callers (and React) rely on reference inequality.
+    const registry = makeRegistry();
+    registry.appendSystem('general', 'first', 'info', NOW);
+
+    const before = registry.history('general');
+    registry.appendSystem('general', 'second', 'info', NOW + 1);
+    const after = registry.history('general');
+
+    assert.notEqual(before, after, 'each call returns a distinct array');
+    assert.equal(before.length, 1, 'the earlier array is not mutated');
+    assert.equal(after.length, 2);
+  });
 });
 
 describe('address merging', () => {

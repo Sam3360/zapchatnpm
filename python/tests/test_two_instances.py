@@ -13,22 +13,28 @@ import tempfile
 import time
 
 
-def _find_exe():
-    """The installed CLI: env override, then common venv spots, then PATH."""
+def _find_command():
+    """How to launch one CLI process.
+
+    Preference order: env override, an installed console script, then this
+    very checkout via `python -m zapchat.cli`. The PATH lookup is deliberately
+    avoided — on a machine with the npm package installed it resolves to the
+    JavaScript shim, and this test would exercise the wrong binary.
+    """
     override = os.environ.get("ZAPCHAT_EXE")
     if override:
-        return override
+        return [override]
     candidates = [
         os.path.join(sys.prefix, "Scripts", "zapchat.exe"),
         os.path.join(sys.prefix, "bin", "zapchat"),
     ]
     for candidate in candidates:
         if os.path.exists(candidate):
-            return candidate
-    return "zapchat"
+            return [candidate]
+    return [sys.executable, "-m", "zapchat.cli"]
 
 
-EXE = _find_exe()
+COMMAND = _find_command()
 
 
 class Instance:
@@ -41,7 +47,7 @@ class Instance:
     def __init__(self, name, room, config_dir):
         self.name = name
         self.process = subprocess.Popen(
-            [EXE, "--name", name, "--room", room],
+            [*COMMAND, "--name", name, "--room", room],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -80,16 +86,16 @@ class Instance:
 
 
 def test_two_instances_chat():
-    # The live test needs a runnable CLI. When ZAPCHAT_EXE is unset and the
-    # resolved default is not our own Python CLI (e.g. the npm shim on PATH),
-    # skip rather than test the wrong binary.
-    import shutil
+    # The live test needs a runnable Python CLI. When neither ZAPCHAT_EXE nor
+    # an installed script exists, the -m fallback needs this checkout on
+    # sys.path — skip rather than fail when it is not importable.
+    if COMMAND[0] == sys.executable and COMMAND[1:3] == ["-m", "zapchat.cli"]:
+        try:
+            import zapchat.cli  # noqa: F401
+        except ImportError:
+            import pytest
 
-    resolved = os.environ.get("ZAPCHAT_EXE") or shutil.which("zapchat")
-    if resolved is None or resolved.lower().endswith(".cmd"):
-        import pytest
-
-        pytest.skip("no Python zapchat CLI on PATH; set ZAPCHAT_EXE to run the live test")
+            pytest.skip("no Python zapchat CLI available; set ZAPCHAT_EXE to run the live test")
 
     with tempfile.TemporaryDirectory() as tmp:
         alice = Instance("alice", "general", os.path.join(tmp, "a"))

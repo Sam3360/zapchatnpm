@@ -6,6 +6,7 @@
  * multi-line messages, long words, emoji and CJK text behave predictably.
  */
 
+import { MIN_ID_PREFIX_CHARS } from '../../protocol/constants.js';
 import type { ChatMessage } from '../../rooms/registry.js';
 import { theme, userColor } from '../theme.js';
 import { displayWidth, padEndTo, wrapText } from './text.js';
@@ -164,7 +165,26 @@ export function buildTimeline(
 
     const isSelf = message.self || message.username === options.selfName;
     const nameColor = isSelf ? theme.self : userColor(message.from || message.username);
-    const wrapped = wrapText(message.text, Math.max(1, width - columns.prefixWidth));
+
+    // A reaction is not chat text: render it as a compact, dim aside so the
+    // conversation stays readable ("👍 alex reacted").
+    if (message.reaction !== undefined && message.reaction.length > 0) {
+      lines.push({
+        key: message.id,
+        spans: [
+          { text: ` ${message.reaction} `, color: theme.system },
+          { text: message.username || 'someone', color: nameColor, dim: true },
+          { text: ' reacted', dim: true },
+        ],
+      });
+      return;
+    }
+
+    // Replies quote the target's author when we can resolve the reference.
+    const quoted = message.replyTo === undefined ? undefined : resolveQuoted(messages, message.replyTo);
+    const replyPrefix = quoted === undefined ? undefined : `↩ ${quoted.username || 'earlier message'}: `;
+    const bodyWidth = Math.max(1, width - columns.prefixWidth - (replyPrefix === undefined ? 0 : displayWidth(replyPrefix)));
+    const wrapped = wrapText(message.text, bodyWidth);
 
     wrapped.forEach((text, lineIndex) => {
       const spans: Span[] = [];
@@ -179,7 +199,15 @@ export function buildTimeline(
           color: nameColor,
           bold: isSelf,
         });
+        if (replyPrefix !== undefined) {
+          spans.push({ text: replyPrefix, dim: true });
+        }
         spans.push({ text });
+        // A queued message has not reached anybody yet: say so, so it is never
+        // mistaken for a message the room has already seen.
+        if (message.queued === true) {
+          spans.push({ text: '  (queued)', color: 'yellow', dim: true });
+        }
       } else {
         spans.push({ text: pad + text });
       }
@@ -189,6 +217,22 @@ export function buildTimeline(
   });
 
   return lines;
+}
+
+/**
+ * Resolve a reply reference (a full id or a unique prefix) to the message it
+ * quotes. Only ids of at least MIN_ID_PREFIX_CHARS are meaningful; anything
+ * shorter would be ambiguous, so we ignore it.
+ */
+function resolveQuoted(
+  messages: readonly ChatMessage[],
+  ref: string,
+): ChatMessage | undefined {
+  if (ref.length < MIN_ID_PREFIX_CHARS) {
+    return undefined;
+  }
+
+  return messages.find(message => message.id === ref || message.id.startsWith(ref));
 }
 
 /** Truncate a username to the name column width (ellipsis when it does not fit). */

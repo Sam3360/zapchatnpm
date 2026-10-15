@@ -126,3 +126,46 @@ export const DEFAULT_ROOM = 'general';
 
 /** Tolerance for incoming timestamps (beacon/frame skew). */
 export const MAX_CLOCK_SKEW_MS = 10 * 60 * 1000;
+
+// ---------------------------------------------------------------- v8 additions
+// Every new limit below is mirrored in `python/zapchat/protocol.py`; keep the
+// two stacks in sync or npm↔Py transfers and reactions silently misbehave.
+
+/** Longest reaction emoji/text accepted on the wire (code points). */
+export const MAX_REACTION_CHARS = 16;
+
+/** Reactions must come from this set — no free-form text, no zero-width junk. */
+export const REACTION_SET = [
+  '👍', '👎', '❤', '😂', '😮', '😢', '🎉', '🔥',
+  '+1', '-1', 'lol', 'ok', 'wow', 'hm',
+] as const;
+
+/** Message ids may be given as a unique prefix of at least this length. */
+export const MIN_ID_PREFIX_CHARS = 4;
+
+/** Largest file we will offer or accept, in bytes. */
+export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+/** Raw bytes per FILE_CHUNK payload (base64 must keep the frame under 8 KiB). */
+export const FILE_CHUNK_BYTES = 4096;
+
+/** Upper bound on chunk indices we accept (derived from the size cap). */
+export const MAX_FILE_CHUNKS = Math.ceil(MAX_FILE_BYTES / FILE_CHUNK_BYTES);
+
+/** Longest received file name (after sanitisation), in characters. */
+export const MAX_FILE_NAME_CHARS = 120;
+
+/** Simultaneous transfers (in + out) per client. */
+export const MAX_ACTIVE_TRANSFERS = 8;
+
+/** An incoming transfer with no chunks for this long expires and is deleted. */
+export const TRANSFER_IDLE_TIMEOUT_MS = 60 * 1000;
+
+/** Subdirectory of the OS temp dir where received files land. */
+export const RECEIVED_FILES_DIR = 'zapchat-received';
+
+/** How many messages the offline queue buffers per client while disconnected. */
+export const OFFLINE_QUEUE_LIMIT = 100;
+
+/** Queued messages older than this are dropped (temporary by design). */
+export const OFFLINE_QUEUE_TTL_MS = 10 * 60 * 1000;

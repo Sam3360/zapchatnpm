@@ -10,29 +10,49 @@
  * local subnet and direct TCP links to peers on the LAN.
  */
 
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
+import path from 'node:path';
 import {
   DEFAULT_DISCOVERY_PORT,
   DEFAULT_ROOM,
   DEFAULT_TCP_PORT_BASE,
+  FILE_CHUNK_BYTES,
   LEGACY_WIRE_VERSION,
+  MAX_ACTIVE_TRANSFERS,
+  MAX_FILE_BYTES,
   MAX_ROOM_NAME_LENGTH,
   MAX_USERNAME_LENGTH,
+  OFFLINE_QUEUE_LIMIT,
   PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   SWEEP_INTERVAL_MS,
+  TRANSFER_IDLE_TIMEOUT_MS,
 } from '../protocol/constants.js';
 import {
   createEnvelope,
+  newMessageId,
+  readFileChunkData,
+  readFileOfferData,
   readHelloData,
   readMessageData,
   readPeerListData,
+  readReplyData,
+  readReactionData,
   readRoomListData,
-  newMessageId,
+  readTransferIdData,
   type Envelope,
   type PeerContact,
 } from '../protocol/messages.js';
+import {
+  formatBytes,
+  isTransferableSize,
+  receivedFilesDir,
+  receivedFilePath,
+  sanitizeFileName,
+} from '../files/transfers.js';
 import { encodeActionMessage, isActionMessage, renderAction } from '../protocol/actions.js';
 import { RateLimiter } from '../protocol/ratelimit.js';
 import {
@@ -45,6 +65,7 @@ import {
 } from '../protocol/sanitize.js';
 import { loadConfig, saveConfigTo, type Config, type LoadConfigOptions } from '../config/config.js';
 import { createClientId, defaultUsername } from '../config/identity.js';
+import { identityKeyId } from '../config/config.js';
 import { DiscoveryService, type DiscoveryKind, type DiscoveryState } from '../discovery/discovery.js';
 import { TcpTransport, type PeerGoneReason, type PeerHandle } from '../network/transport.js';
 import { PeerPinStore } from '../protocol/handshake.js';
@@ -109,6 +130,10 @@ export interface Snapshot {
   members: PeerSnapshot[];
   messages: ChatMessage[];
   notice: NoticeSnapshot | null;
+  /** v8: active file transfers (incoming and outgoing), for progress UI. */
+  transfers: TransferSnapshot[];
+  /** v8: messages buffered while nobody was reachable, oldest first. */
+  queued: QueuedMessageSnapshot[];
   status: StatusSnapshot;
 }
 
@@ -141,8 +166,85 @@ interface AttemptState {
   nextAt: number;
 }
 
+// ------------------------------------------------------------------ transfers
+
+/** Where an outgoing offer has got to for one specific room member. */
+type OutgoingPeerPhase = 'offered' | 'sending' | 'done' | 'rejected' | 'cancelled';
+
+interface OutgoingPeer {
+  phase: OutgoingPeerPhase;
+  /** Bytes handed to the socket for this peer so far. */
+  sent: number;
+}
+
+/** A file we offered to the room (`/file <path>`). */
+interface OutgoingTransfer {
+  id: string;
+  room: string;
+  path: string;
+  /** Sanitised bare name sent on the wire and shown in the timeline. */
+  name: string;
+  size: number;
+  /** Last time we pushed bytes or saw a peer response (drives the sweep). */
+  lastActivity: number;
+  /** Set by `cancelTransfer` / the idle sweep; stream loops watch it. */
+  cancelled: boolean;
+  peers: Map<string, OutgoingPeer>;
+}
+
+/** A file a peer is streaming to us, already opened in the received dir. */
+interface IncomingTransfer {
+  id: string;
+  from: string;
+  fromUsername: string;
+  room: string;
+  name: string;
+  size: number;
+  /** Absolute path inside the received dir (unique `<id>-<name>` prefix). */
+  target: string;
+  /** Bytes accepted so far (equals the sum of queued writes). */
+  received: number;
+  /** Next wire chunk index we will accept (TCP keeps them ordered). */
+  nextIndex: number;
+  lastActivity: number;
+  handle: fsp.FileHandle;
+  /** Serialises disk writes so chunks land on disk in wire order. */
+  pending: Promise<void>;
+}
+
+/** UI-facing view of one buffered message (`Snapshot.queued`). */
+export interface QueuedMessageSnapshot {
+  id: string;
+  room: string;
+  /** One-line preview: the text as typed (truncated by the caller). */
+  text: string;
+  ts: number;
+}
+
+/** UI-facing view of one active transfer (`Snapshot.transfers`). */
+export interface TransferSnapshot {
+  id: string;
+  direction: 'send' | 'receive';
+  /** Bare file name (already sanitised). */
+  name: string;
+  size: number;
+  /** For sends: max bytes pushed to any peer. For receives: bytes on disk. */
+  transferred: number;
+  state: 'offering' | 'sending' | 'receiving';
+}
+
 /** How long a footer notice stays on screen before the hints come back. */
 const NOTICE_TTL_MS = 6000;
+
+/**
+ * Chunk-sender pacing: wait for the socket buffer to drain below this before
+ * writing more. Must stay comfortably under the transport's drop threshold
+ * (MAX_PENDING_WRITE_BYTES) so a fast sender never trips the peer-drop guard.
+ */
+const TRANSFER_PACE_BYTES = 256 * 1024;
+
+/** Minimum gap between transfer-progress snapshot emissions. */
+const TRANSFER_EMIT_MS = 200;
 
 export class ZapClient {
   readonly #options: ZapClientOptions;
@@ -157,6 +259,11 @@ export class ZapClient {
   #registry: RoomRegistry;
   /** TOFU pin store for peer identity keys (protocol v2). */
   #pinStore: PeerPinStore;
+  /**
+   * Identity key id last presented by each peer, for `/fingerprint`. Kept
+   * separate from the pin store so a peer's key is still shown after `/untrust`.
+   */
+  readonly #peerKeyIds = new Map<string, string>();
 
   #discovery: DiscoveryService | null = null;
   #transport: TcpTransport | null = null;
@@ -182,6 +289,22 @@ export class ZapClient {
   /** Peers we have warned about legacy-protocol plaintext dials (v5). */
   readonly #legacyWarned = new Set<string>();
   #peerListDirty = false;
+
+  // ---- v8 file transfers -------------------------------------------------
+  /** Offers we published: room, path and per-peer send progress. */
+  readonly #outgoing = new Map<string, OutgoingTransfer>();
+  /** Files peers are streaming to us, keyed by transfer id. */
+  readonly #incoming = new Map<string, IncomingTransfer>();
+  /** Ids whose target file is being opened (dedup + capacity guard). */
+  readonly #pendingIncoming = new Set<string>();
+  /**
+   * Messages sent while the room had no reachable peer. They keep their
+   * original envelope (and therefore id and timestamp) so the replay looks
+   * like the delayed send it was, not a fresh message.
+   */
+  readonly #offlineQueue = new Map<string, Envelope>();
+  /** Throttle for progress-only snapshot emissions. */
+  #lastTransferEmit = 0;
 
   constructor(options: ZapClientOptions = {}) {
     this.#options = options;
@@ -296,6 +419,7 @@ export class ZapClient {
         clientId: this.#clientId,
         identitySeed: Buffer.from(this.#config.identityKey, 'base64'),
         checkPeerPin: (clientId, identityKeyId) => {
+          this.#peerKeyIds.set(clientId, identityKeyId);
           const verdict = this.#pinStore.check(clientId, identityKeyId, this.#now());
           if (verdict === 'new') {
             // First contact with this peer: persist the pin immediately so it
@@ -380,6 +504,21 @@ export class ZapClient {
 
     if (this.#registry.selfRoom !== null) {
       this.#broadcastPresence('LEAVE');
+    }
+
+    // Abort transfers: peers get FILE_CANCEL where a link is still open, and
+    // partial incoming files are removed from disk.
+    for (const [id, transfer] of [...this.#outgoing]) {
+      this.#outgoing.delete(id);
+      transfer.cancelled = true;
+      for (const peerId of transfer.peers.keys()) {
+        this.#sendTransferControl('FILE_CANCEL', peerId, transfer.id, transfer.room);
+      }
+    }
+
+    for (const [id, transfer] of [...this.#incoming]) {
+      this.#incoming.delete(id);
+      this.#discardIncoming(transfer);
     }
 
     this.#transport?.close();
@@ -544,7 +683,15 @@ export class ZapClient {
 
     const delivered = this.#sendToRoom(room, envelope);
     if (delivered === 0) {
-      this.#setNotice('warn', 'no peers are connected yet — your message is only local for now');
+      // Nobody was reachable: buffer it and replay when a peer shows up rather
+      // than silently dropping what the user just wrote.
+      const queued = this.#queueOffline(envelope, room);
+      this.#setNotice(
+        'warn',
+        queued
+          ? 'no peers are connected yet — your message is queued and will send when one joins'
+          : 'no peers are connected yet — the offline queue was full, so the oldest queued message was dropped',
+      );
     } else if (this.#notice?.tone === 'warn') {
       this.#notice = null;
     }
@@ -552,6 +699,92 @@ export class ZapClient {
     this.#markDirty();
     this.#emit();
     return { ok: true };
+  }
+
+  /**
+   * Buffer an envelope that reached nobody. Returns false when the queue is
+   * full (the caller tells the user their message was not sent at all, which
+   * is far better than pretending it is waiting somewhere).
+   */
+  #queueOffline(envelope: Envelope, room: string): boolean {
+    const hadRoom = this.#offlineQueue.size < OFFLINE_QUEUE_LIMIT;
+    if (!hadRoom) {
+      // Full: drop the oldest so the message the user just wrote survives, and
+      // say so rather than losing their history silently.
+      const oldest = this.#offlineQueue.keys().next();
+      if (oldest.done !== true) {
+        this.#offlineQueue.delete(oldest.value);
+      }
+    }
+
+    this.#offlineQueue.set(envelope.id, envelope);
+    this.#registry.setQueued(room, envelope.id, true);
+
+    return hadRoom;
+  }
+
+  /**
+   * Replay buffered messages once their room has somebody in it.
+   *
+   * Per-envelope rather than per-room so one busy room cannot hold up (or
+   * leak) another room's backlog; the oldest message goes first.
+   */
+  #flushOfflineQueue(): void {
+    if (this.#offlineQueue.size === 0) {
+      return;
+    }
+
+    const transport = this.#transport;
+    if (transport === null) {
+      return;
+    }
+
+    let flushed = 0;
+    const flushedByRoom = new Map<string, number>();
+    for (const [id, envelope] of [...this.#offlineQueue]) {
+      const room = envelope.room;
+      if (room === null || this.#membersInRoom(room).length === 0) {
+        continue;
+      }
+
+      if (this.#sendToRoom(room, envelope) > 0) {
+        // Capture the room before dropping it from the queue: the timeline
+        // still needs to know which room's echo to un-flag.
+        this.#offlineQueue.delete(id);
+        this.#registry.setQueued(room, id, false);
+        flushedByRoom.set(room, (flushedByRoom.get(room) ?? 0) + 1);
+        flushed += 1;
+      }
+    }
+
+    if (flushed === 0) {
+      return;
+    }
+
+    for (const [room, count] of flushedByRoom) {
+      this.#registry.appendSystem(
+        room,
+        `sent ${count} queued ${count === 1 ? 'message' : 'messages'} now that a peer is here`,
+        'info',
+        this.#now(),
+      );
+    }
+
+    this.#setNotice('ok', `sent ${flushed} queued ${flushed === 1 ? 'message' : 'messages'}`);
+    this.#markDirty();
+  }
+
+  /** Client ids of peers currently in `room` (excluding the local user). */
+  #membersInRoom(room: string): string[] {
+    const transport = this.#transport;
+    if (transport === null) {
+      return [];
+    }
+
+    return transport
+      .peerIds()
+      .filter(clientId => clientId !== this.#clientId)
+      .filter(clientId => this.#registry.getPeer(clientId)?.room === room);
   }
 
   /** Change the display name and tell peers about it immediately. */
@@ -694,6 +927,282 @@ export class ZapClient {
     this.#emit();
   }
 
+  /** Send a reply to a message in the current room. */
+  sendReply(targetId: string, text: string): ActionResult {
+    return this.#sendReplyReaction('REPLY', targetId, text);
+  }
+
+  /** Send a reaction to a message in the current room. */
+  sendReaction(targetId: string, reaction: string): ActionResult {
+    return this.#sendReplyReaction('REACTION', targetId, reaction);
+  }
+
+  /**
+   * Our own long-term identity: the fingerprint of the Ed25519 key in the
+   * config file. Two peers can compare this out of band to be sure they are
+   * talking to the same person across a hostile network.
+   */
+  identityFingerprint(): string {
+    return identityKeyId(this.#config);
+  }
+
+  /** Fingerprint of a peer's identity key, or null when we have not seen one. */
+  peerFingerprint(clientId: string): string | null {
+    return this.#peerKeyIds.get(clientId) ?? null;
+  }
+
+  /**
+   * Pin a peer's current key (`/trust <user>`).
+   *
+   * After a legitimate reinstall a peer presents a new key, which TOFU would
+   * refuse as an impostor. Trusting re-pins the key they have now, so the link
+   * works again — and a *third* key is still refused.
+   */
+  trust(clientId: string): ActionResult {
+    const peer = this.#registry.getPeer(clientId);
+    if (peer === undefined) {
+      return this.#fail(`no peer with client id ${clientId}`);
+    }
+
+    const keyId = this.#peerKeyIds.get(clientId);
+    if (keyId === undefined) {
+      return this.#fail(`${peer.username} has not completed a handshake yet — no key to trust`);
+    }
+
+    this.#pinStore.trust(clientId, keyId, this.#now());
+    this.#config = { ...this.#config, peerPins: this.#pinStore.toConfig() };
+    this.#writeConfig();
+    this.#markDirty();
+    this.#emit();
+    return { ok: true };
+  }
+
+  /**
+   * Forget a peer's pin (`/untrust <user>`).
+   *
+   * The next contact is treated as first contact, so a rebuilt install gets in
+   * — but at the cost of the protection against an impostor, which is why the
+   * command exists rather than being automatic.
+   */
+  untrust(clientId: string): ActionResult {
+    const peer = this.#registry.getPeer(clientId);
+    if (peer === undefined) {
+      return this.#fail(`no peer with client id ${clientId}`);
+    }
+
+    if (!this.#pinStore.untrust(clientId)) {
+      return this.#fail(`${peer.username} had no pinned key`);
+    }
+
+    this.#config = { ...this.#config, peerPins: this.#pinStore.toConfig() };
+    this.#writeConfig();
+    this.#markDirty();
+    this.#emit();
+    return { ok: true };
+  }
+
+  /** Offer a local file to everyone in the current room. */
+  offerFile(filePath: string): ActionResult {
+    const room = this.#registry.selfRoom;
+    if (room === null) {
+      return this.#fail('join a room first (/join general)');
+    }
+
+    const trimmed = filePath.trim();
+    if (trimmed.length === 0) {
+      return this.#fail('usage: /file <file-path>');
+    }
+
+    let stats: fs.Stats;
+    try {
+      stats = fs.statSync(trimmed);
+    } catch {
+      return this.#fail(`cannot read ${trimmed} (no such file)`);
+    }
+
+    if (!stats.isFile()) {
+      return this.#fail(`${trimmed} is not a regular file`);
+    }
+
+    if (!isTransferableSize(stats.size) || stats.size === 0) {
+      return this.#fail(
+        `file is empty or larger than ${formatBytes(MAX_FILE_BYTES)}`,
+      );
+    }
+
+    const name = sanitizeFileName(path.basename(trimmed));
+    if (name === null) {
+      return this.#fail('file name is not usable');
+    }
+
+    if (
+      this.#outgoing.size + this.#incoming.size + this.#pendingIncoming.size >=
+      MAX_ACTIVE_TRANSFERS
+    ) {
+      return this.#fail(`too many active transfers (max ${MAX_ACTIVE_TRANSFERS})`);
+    }
+
+    const transport = this.#transport;
+    if (transport === null) {
+      return this.#fail('client is not started');
+    }
+
+    const targets = transport
+      .peerIds()
+      .filter(clientId => clientId !== this.#clientId)
+      .filter(clientId => this.#registry.getPeer(clientId)?.room === room);
+
+    if (targets.length === 0) {
+      return this.#fail('no peers are connected in this room yet — nobody can accept the offer');
+    }
+
+    const now = this.#now();
+    const transfer: OutgoingTransfer = {
+      id: newMessageId(),
+      room,
+      path: trimmed,
+      name,
+      size: stats.size,
+      lastActivity: now,
+      cancelled: false,
+      peers: new Map(targets.map(clientId => [clientId, { phase: 'offered', sent: 0 }])),
+    };
+    this.#outgoing.set(transfer.id, transfer);
+
+    const envelope = createEnvelope('FILE_OFFER', this.#identity(), {
+      room,
+      data: { transferId: transfer.id, name, size: stats.size },
+      ts: now,
+    });
+    transport.sendMany(targets, envelope);
+
+    this.#registry.appendSystem(
+      room,
+      `offering ${name} (${formatBytes(stats.size)}) to ${targets.length === 1 ? 'the room' : `${targets.length} peers`}`,
+      'info',
+      now,
+    );
+    this.#setNotice('info', `offering ${name} — waiting for someone to accept`);
+    this.#markDirty();
+    this.#emit();
+    return { ok: true };
+  }
+
+  /**
+   * Abort transfers. With no argument every active transfer is cancelled:
+   * outgoing offers tell their peers (FILE_CANCEL) and stop streaming, incoming
+   * partials are closed and deleted so nothing half-written survives.
+   */
+  cancelTransfer(transferId?: string): ActionResult {
+    const wanted = transferId?.trim();
+    let cancelled = 0;
+
+    for (const [id, transfer] of [...this.#outgoing]) {
+      if (wanted !== undefined && wanted.length > 0 && !id.startsWith(wanted)) {
+        continue;
+      }
+
+      this.#outgoing.delete(id);
+      transfer.cancelled = true;
+
+      const transport = this.#transport;
+      if (transport !== null) {
+        for (const peerId of transfer.peers.keys()) {
+          if (transport.hasPeer(peerId)) {
+            transport.sendTo(
+              peerId,
+              createEnvelope('FILE_CANCEL', this.#identity(), {
+                room: transfer.room,
+                data: { transferId: transfer.id },
+                ts: this.#now(),
+              }),
+            );
+          }
+        }
+      }
+
+      this.#registry.appendSystem(
+        transfer.room,
+        `cancelled sending ${transfer.name}`,
+        'warn',
+        this.#now(),
+      );
+      cancelled += 1;
+    }
+
+    for (const [id, transfer] of [...this.#incoming]) {
+      if (wanted !== undefined && wanted.length > 0 && !id.startsWith(wanted)) {
+        continue;
+      }
+
+      this.#incoming.delete(id);
+      this.#discardIncoming(transfer);
+      // Tell the sender to stop: a cancelled download must never count as
+      // received, and the sender must retire its offer instead of streaming
+      // chunks into the void until the whole file is pushed.
+      this.#sendTransferControl('FILE_CANCEL', transfer.from, transfer.id, transfer.room);
+      cancelled += 1;
+    }
+
+    if (cancelled === 0) {
+      return this.#fail(
+        wanted !== undefined && wanted.length > 0
+          ? `no transfer matching "${wanted}"`
+          : 'no active transfers',
+      );
+    }
+
+    this.#markDirty();
+    this.#emit();
+    return { ok: true };
+  }
+
+  #sendReplyReaction(
+    type: 'REPLY' | 'REACTION',
+    targetId: string,
+    payload: string,
+  ): ActionResult {
+    const room = this.#registry.selfRoom;
+    if (room === null) {
+      return this.#fail('join a room first (/join general)');
+    }
+
+    const envelope = createEnvelope(type, this.#identity(), {
+      room,
+      data:
+        type === 'REPLY'
+          ? { text: payload, replyTo: targetId }
+          : { target: targetId, reaction: payload },
+      ts: this.#now(),
+    });
+
+    this.#registry.markSeen(envelope.id, this.#now());
+
+    this.#registry.recordMessage({
+      id: envelope.id,
+      room,
+      kind: 'chat',
+      text: type === 'REPLY' ? payload : '',
+      replyTo: type === 'REPLY' ? targetId : undefined,
+      reaction: type === 'REACTION' ? payload : undefined,
+      from: this.#clientId,
+      username: this.#username,
+      ts: envelope.ts,
+      self: true,
+    });
+
+    const delivered = this.#sendToRoom(room, envelope);
+    if (delivered === 0) {
+      this.#setNotice('warn', 'no peers are connected yet — your reaction is only local for now');
+    } else if (this.#notice?.tone === 'warn') {
+      this.#notice = null;
+    }
+
+    this.#markDirty();
+    this.#emit();
+    return { ok: true };
+  }
+
   /** Footer notice (transient status message). */
   setNotice(tone: NoticeSnapshot['tone'], text: string): void {
     this.#setNotice(tone, text);
@@ -806,6 +1315,39 @@ export class ZapClient {
     const now = this.#now();
     this.#registry.setPeerConnection(peer.clientId, false, now);
     this.#peerListDirty = true;
+
+    // In-flight transfers with this peer can never finish: abort both sides so
+    // partial files do not linger until the idle sweep reaps them.
+    let changed = false;
+    for (const transfer of this.#outgoing.values()) {
+      const entry = transfer.peers.get(peer.clientId);
+      if (entry === undefined || entry.phase === 'done') {
+        continue;
+      }
+
+      entry.phase = 'cancelled';
+      this.#maybeRetireOutgoing(transfer);
+    }
+
+    for (const [id, transfer] of [...this.#incoming]) {
+      if (transfer.from !== peer.clientId) {
+        continue;
+      }
+
+      this.#incoming.delete(id);
+      this.#discardIncoming(transfer);
+      this.#registry.appendSystem(
+        transfer.room,
+        `${peer.username} disconnected — ${transfer.name} transfer aborted`,
+        'warn',
+        now,
+      );
+      changed = true;
+    }
+
+    if (changed) {
+      this.#markDirty();
+    }
 
     if (reason !== 'shutdown' && !this.#reconnecting.has(peer.clientId)) {
       this.#reconnecting.add(peer.clientId);
@@ -955,6 +1497,263 @@ export class ZapClient {
         break;
       }
 
+      case 'REPLY':
+      case 'REACTION': {
+        if (envelope.room === null) {
+          break;
+        }
+
+        // Same flood guard and dedup as ordinary messages, so a hostile peer
+        // cannot bypass the limiter by using a reply instead of a message.
+        if (!this.#messageLimiter.allow(envelope.from)) {
+          break;
+        }
+
+        if (!this.#registry.markSeen(envelope.id, now)) {
+          break;
+        }
+
+        this.#registry.noteRoom(envelope.room, now);
+        const myRoom = this.#registry.selfRoom;
+        if (envelope.room === myRoom) {
+          if (envelope.type === 'REPLY') {
+            const data = readReplyData(envelope);
+            if (data === null) {
+              break;
+            }
+
+            this.#registry.recordMessage({
+              id: envelope.id,
+              room: envelope.room,
+              kind: 'chat',
+              text: data.text,
+              replyTo: data.replyTo,
+              from: envelope.from,
+              username: envelope.username,
+              ts: envelope.ts,
+              self: false,
+            });
+          } else {
+            const data = readReactionData(envelope);
+            if (data === null) {
+              break;
+            }
+
+            this.#registry.recordMessage({
+              id: envelope.id,
+              room: envelope.room,
+              kind: 'chat',
+              text: '',
+              reaction: data.reaction,
+              replyTo: data.target,
+              from: envelope.from,
+              username: envelope.username,
+              ts: envelope.ts,
+              self: false,
+            });
+          }
+
+          this.#markDirty();
+          this.#emit();
+        }
+
+        // Relay to direct room members except the sender, like MESSAGE.
+        if (myRoom !== null && envelope.room === myRoom) {
+          this.#sendToRoom(myRoom, envelope, envelope.from);
+        }
+
+        break;
+      }
+
+      case 'FILE_OFFER': {
+        const data = readFileOfferData(envelope);
+        if (data === null || envelope.room === null) {
+          break;
+        }
+
+        // Offers follow the same flood/dedup rules as chat: a hostile peer
+        // must not be able to open hundreds of half-written files on disk.
+        if (!this.#messageLimiter.allow(envelope.from)) {
+          break;
+        }
+
+        if (!this.#registry.markSeen(envelope.id, now)) {
+          break;
+        }
+
+        this.#registry.noteRoom(envelope.room, now);
+        if (envelope.room !== this.#registry.selfRoom) {
+          break;
+        }
+
+        void this.#acceptOffer(envelope, data.transferId, data.name, data.size);
+        break;
+      }
+
+      case 'FILE_ACCEPT': {
+        const parsed = readTransferIdData(envelope);
+        if (parsed === null) {
+          break;
+        }
+
+        const transfer = this.#outgoing.get(parsed.transferId);
+        if (transfer === undefined || transfer.cancelled) {
+          // We are no longer offering it (cancelled/expired): tell the peer to
+          // stop waiting for chunks.
+          this.#sendTransferControl('FILE_CANCEL', envelope.from, parsed.transferId, transfer?.room ?? envelope.room);
+          break;
+        }
+
+        const entry = transfer.peers.get(envelope.from);
+        if (entry === undefined || entry.phase !== 'offered') {
+          break;
+        }
+
+        entry.phase = 'sending';
+        transfer.lastActivity = this.#now();
+        void this.#streamToPeer(transfer, envelope.from);
+        break;
+      }
+
+      case 'FILE_REJECT': {
+        const parsed = readTransferIdData(envelope);
+        if (parsed === null) {
+          break;
+        }
+
+        const transfer = this.#outgoing.get(parsed.transferId);
+        const entry = transfer?.peers.get(envelope.from);
+        if (transfer !== undefined && entry !== undefined && entry.phase === 'offered') {
+          entry.phase = 'rejected';
+          this.#maybeRetireOutgoing(transfer);
+        }
+        break;
+      }
+
+      case 'FILE_CHUNK': {
+        const chunk = readFileChunkData(envelope);
+        if (chunk === null) {
+          break;
+        }
+
+        const transfer = this.#incoming.get(chunk.transferId);
+        // Chunks only ever come from the peer whose offer we accepted, only in
+        // order, and only up to the advertised size — anything else is dropped.
+        if (transfer === undefined || transfer.from !== envelope.from) {
+          break;
+        }
+
+        if (chunk.index !== transfer.nextIndex) {
+          break;
+        }
+
+        const bytes = Buffer.from(chunk.data, 'base64');
+        if (bytes.length === 0 || bytes.length > FILE_CHUNK_BYTES) {
+          break;
+        }
+
+        if (transfer.received + bytes.length > transfer.size) {
+          // Sender overshot its own advertised size: abort, delete the partial.
+          this.#incoming.delete(chunk.transferId);
+          this.#sendTransferControl('FILE_CANCEL', transfer.from, transfer.id, transfer.room);
+          this.#discardIncoming(transfer);
+          this.#registry.appendSystem(
+            transfer.room,
+            `${transfer.fromUsername} sent more data than promised for ${transfer.name} — discarded`,
+            'error',
+            this.#now(),
+          );
+          this.#markDirty();
+          this.#emit();
+          break;
+        }
+
+        transfer.nextIndex += 1;
+        transfer.received += bytes.length;
+        transfer.lastActivity = this.#now();
+        this.#queueChunkWrite(transfer, bytes);
+        break;
+      }
+
+      case 'FILE_COMPLETE': {
+        const parsed = readTransferIdData(envelope);
+        if (parsed === null) {
+          break;
+        }
+
+        const transfer = this.#incoming.get(parsed.transferId);
+        if (transfer === undefined || transfer.from !== envelope.from) {
+          break;
+        }
+
+        this.#incoming.delete(parsed.transferId);
+        const { target, name, fromUsername, room, size } = transfer;
+
+        // Drain queued writes, then confirm the size actually matches what the
+        // sender advertised before we announce success.
+        transfer.pending
+          .then(() => transfer.handle.close())
+          .then(() => {
+            const written = fs.statSync(target).size;
+            if (written !== size) {
+              fs.rmSync(target, { force: true });
+              this.#registry.appendSystem(
+                room,
+                `received ${name} from ${fromUsername} was incomplete (${written} of ${size} bytes) — discarded`,
+                'error',
+                this.#now(),
+              );
+            } else {
+              this.#registry.appendSystem(
+                room,
+                `received ${name} (${formatBytes(size)}) from ${fromUsername} → ${target}`,
+                'info',
+                this.#now(),
+              );
+            }
+
+            this.#markDirty();
+            this.#emit();
+          })
+          .catch(error => {
+            this.#log(`incoming transfer failed: ${(error as Error).message}`, 'warn');
+          });
+        break;
+      }
+
+      case 'FILE_CANCEL': {
+        const parsed = readTransferIdData(envelope);
+        if (parsed === null) {
+          break;
+        }
+
+        const outgoing = this.#outgoing.get(parsed.transferId);
+        if (outgoing !== undefined) {
+          const entry = outgoing.peers.get(envelope.from);
+          if (entry !== undefined && entry.phase === 'sending') {
+            entry.phase = 'cancelled';
+            outgoing.cancelled = outgoing.cancelled || this.#allPeersSettled(outgoing);
+            this.#maybeRetireOutgoing(outgoing);
+          }
+          break;
+        }
+
+        const incoming = this.#incoming.get(parsed.transferId);
+        if (incoming !== undefined && incoming.from === envelope.from) {
+          this.#incoming.delete(parsed.transferId);
+          this.#discardIncoming(incoming);
+          this.#registry.appendSystem(
+            incoming.room,
+            `${incoming.fromUsername} cancelled the transfer of ${incoming.name}`,
+            'warn',
+            this.#now(),
+          );
+          this.#markDirty();
+          this.#emit();
+        }
+        break;
+      }
+
       default:
         break;
     }
@@ -1099,8 +1898,65 @@ export class ZapClient {
       this.#peerListDirty = false;
     }
 
+    this.#sweepTransfers(now);
+    this.#flushOfflineQueue();
+
     if (this.#dirty) {
       this.#emit();
+    }
+  }
+
+  /**
+   * Expire transfers nobody is feeding any more: incoming partials are deleted
+   * from disk, outgoing offers are cancelled to their peers. A transfer that
+   * keeps moving updates `lastActivity` on every chunk, so only genuinely
+   * stalled transfers are reaped.
+   */
+  #sweepTransfers(now: number): void {
+    let changed = false;
+
+    for (const [id, transfer] of [...this.#incoming]) {
+      if (now - transfer.lastActivity <= TRANSFER_IDLE_TIMEOUT_MS) {
+        continue;
+      }
+
+      this.#incoming.delete(id);
+      this.#discardIncoming(transfer);
+      this.#sendTransferControl('FILE_CANCEL', transfer.from, transfer.id, transfer.room);
+      this.#registry.appendSystem(
+        transfer.room,
+        `transfer of ${transfer.name} from ${transfer.fromUsername} timed out — partial file deleted`,
+        'warn',
+        now,
+      );
+      changed = true;
+    }
+
+    for (const [id, transfer] of [...this.#outgoing]) {
+      if (now - transfer.lastActivity <= TRANSFER_IDLE_TIMEOUT_MS) {
+        continue;
+      }
+
+      this.#outgoing.delete(id);
+      transfer.cancelled = true;
+      const transport = this.#transport;
+      if (transport !== null) {
+        for (const peerId of transfer.peers.keys()) {
+          this.#sendTransferControl('FILE_CANCEL', peerId, transfer.id, transfer.room);
+        }
+      }
+
+      this.#registry.appendSystem(
+        transfer.room,
+        `offer of ${transfer.name} expired (no peer response)`,
+        'warn',
+        now,
+      );
+      changed = true;
+    }
+
+    if (changed) {
+      this.#markDirty();
     }
   }
 
@@ -1180,6 +2036,291 @@ export class ZapClient {
     for (const clientId of transport.peerIds()) {
       this.#sendPeerList(clientId);
     }
+  }
+
+  // --------------------------------------------------------------- transfers
+
+  /** Unicast a FILE_ACCEPT/REJECT/COMPLETE/CANCEL control frame to one peer. */
+  #sendTransferControl(
+    type: 'FILE_ACCEPT' | 'FILE_REJECT' | 'FILE_COMPLETE' | 'FILE_CANCEL',
+    toClientId: string,
+    transferId: string,
+    room: string | null,
+  ): void {
+    const transport = this.#transport;
+    if (transport === null || !transport.hasPeer(toClientId)) {
+      return;
+    }
+
+    transport.sendTo(
+      toClientId,
+      createEnvelope(type, this.#identity(), {
+        room,
+        data: { transferId },
+        ts: this.#now(),
+      }),
+    );
+  }
+
+  /**
+   * A peer offered us a file in our room. Auto-accept within the hard limits
+   * (size cap, slot cap, sanitised name in the OS temp dir) unless the offer is
+   * stale or we are already receiving this exact transfer.
+   */
+  async #acceptOffer(
+    envelope: Envelope,
+    transferId: string,
+    name: string,
+    size: number,
+  ): Promise<void> {
+    const room = envelope.room;
+    if (room === null) {
+      return;
+    }
+
+    if (
+      this.#incoming.has(transferId) ||
+      this.#pendingIncoming.has(transferId) ||
+      this.#outgoing.size + this.#incoming.size + this.#pendingIncoming.size >=
+        MAX_ACTIVE_TRANSFERS
+    ) {
+      this.#sendTransferControl('FILE_REJECT', envelope.from, transferId, room);
+      return;
+    }
+
+    this.#pendingIncoming.add(transferId);
+    try {
+      const dir = receivedFilesDir();
+      await fsp.mkdir(dir, { recursive: true });
+
+      const target = receivedFilePath(dir, transferId, name);
+      if (target === null) {
+        this.#sendTransferControl('FILE_REJECT', envelope.from, transferId, room);
+        return;
+      }
+
+      // "w" creates-or-truncates; the unique `<transferId>-` prefix means we
+      // never clobber an earlier download of the same name.
+      const handle = await fsp.open(target, 'w');
+      const transfer: IncomingTransfer = {
+        id: transferId,
+        from: envelope.from,
+        fromUsername: envelope.username,
+        room,
+        name,
+        size,
+        target,
+        received: 0,
+        nextIndex: 0,
+        lastActivity: this.#now(),
+        handle,
+        pending: Promise.resolve(),
+      };
+      this.#incoming.set(transferId, transfer);
+      this.#sendTransferControl('FILE_ACCEPT', envelope.from, transferId, room);
+
+      this.#registry.appendSystem(
+        room,
+        `${envelope.username} offers ${name} (${formatBytes(size)}) — receiving…`,
+        'info',
+        this.#now(),
+      );
+      this.#setNotice('info', `receiving ${name} from ${envelope.username}…`);
+      this.#markDirty();
+      this.#emit();
+    } catch (error) {
+      this.#log(`could not open incoming transfer: ${(error as Error).message}`, 'warn');
+      this.#sendTransferControl('FILE_REJECT', envelope.from, transferId, room);
+    } finally {
+      this.#pendingIncoming.delete(transferId);
+    }
+  }
+
+  /**
+   * Append one decoded chunk to the open file. Writes are chained on
+   * `transfer.pending` so they hit the disk in wire order even though each
+   * `FileHandle.write` is asynchronous; a failed write aborts the transfer.
+   */
+  #queueChunkWrite(transfer: IncomingTransfer, bytes: Buffer): void {
+    transfer.pending = transfer.pending
+      .then(() => transfer.handle.write(bytes))
+      .then(() => {
+        // Progress: rebuild the snapshot at most every TRANSFER_EMIT_MS.
+        const now = this.#now();
+        if (now - this.#lastTransferEmit >= TRANSFER_EMIT_MS) {
+          this.#lastTransferEmit = now;
+          this.#markDirty();
+          this.#emit();
+        }
+      })
+      .catch(error => {
+        this.#log(`incoming transfer write failed: ${(error as Error).message}`, 'warn');
+        if (this.#incoming.delete(transfer.id)) {
+          this.#sendTransferControl('FILE_CANCEL', transfer.from, transfer.id, transfer.room);
+          this.#discardIncoming(transfer);
+          this.#registry.appendSystem(
+            transfer.room,
+            `could not write ${transfer.name} to disk — transfer cancelled`,
+            'error',
+            this.#now(),
+          );
+          this.#markDirty();
+          this.#emit();
+        }
+      });
+  }
+
+  /** Close and delete a partial download. Tolerant: never throws. */
+  #discardIncoming(transfer: IncomingTransfer): void {
+    void transfer.pending
+      .catch(() => undefined)
+      .then(() => transfer.handle.close())
+      .catch(() => undefined)
+      .then(() => fsp.rm(transfer.target, { force: true }))
+      .catch(() => undefined);
+  }
+
+  /**
+   * Stream one offered file to one accepting peer, chunk by chunk.
+   *
+   * Pacing matters: the transport destroys peers whose socket write buffer
+   * passes MAX_PENDING_WRITE_BYTES, so we wait for the kernel to catch up
+   * instead of racing into that threshold. Any of — local cancel, shutdown,
+   * peer disconnect, write refusal — stops the stream cleanly.
+   */
+  async #streamToPeer(transfer: OutgoingTransfer, peerId: string): Promise<void> {
+    const transport = this.#transport;
+    const entry = transfer.peers.get(peerId);
+    if (transport === null || entry === undefined) {
+      return;
+    }
+
+    let handle: fsp.FileHandle | null = null;
+    let completed = false;
+    try {
+      handle = await fsp.open(transfer.path, 'r');
+      const buffer = Buffer.alloc(FILE_CHUNK_BYTES);
+      let index = 0;
+
+      while (true) {
+        if (transfer.cancelled || this.#stopping || !transport.hasPeer(peerId)) {
+          break;
+        }
+
+        // Backpressure: let the socket drain before loading it up again.
+        while (transport.pendingBytes(peerId) > TRANSFER_PACE_BYTES) {
+          if (transfer.cancelled || this.#stopping || !transport.hasPeer(peerId)) {
+            break;
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+
+        if (transfer.cancelled || this.#stopping || !transport.hasPeer(peerId)) {
+          break;
+        }
+
+        const { bytesRead } = await handle.read(buffer, 0, FILE_CHUNK_BYTES, null);
+        if (bytesRead === 0) {
+          completed = true;
+          break;
+        }
+
+        const sent = transport.sendTo(
+          peerId,
+          createEnvelope('FILE_CHUNK', this.#identity(), {
+            room: transfer.room,
+            data: {
+              transferId: transfer.id,
+              index,
+              data: buffer.subarray(0, bytesRead).toString('base64'),
+            },
+            ts: this.#now(),
+          }),
+        );
+
+        if (!sent) {
+          break;
+        }
+
+        index += 1;
+        entry.sent += bytesRead;
+        transfer.lastActivity = this.#now();
+
+        const now = this.#now();
+        if (now - this.#lastTransferEmit >= TRANSFER_EMIT_MS) {
+          this.#lastTransferEmit = now;
+          this.#markDirty();
+          this.#emit();
+        }
+      }
+
+      if (completed && !transfer.cancelled && !this.#stopping && transport.hasPeer(peerId)) {
+        this.#sendTransferControl('FILE_COMPLETE', peerId, transfer.id, transfer.room);
+        entry.phase = 'done';
+      } else {
+        entry.phase = 'cancelled';
+        if (transport.hasPeer(peerId)) {
+          this.#sendTransferControl('FILE_CANCEL', peerId, transfer.id, transfer.room);
+        }
+      }
+    } catch (error) {
+      entry.phase = 'cancelled';
+      this.#log(`outgoing transfer failed: ${(error as Error).message}`, 'warn');
+      if (transport.hasPeer(peerId)) {
+        this.#sendTransferControl('FILE_CANCEL', peerId, transfer.id, transfer.room);
+      }
+    } finally {
+      if (handle !== null) {
+        await handle.close().catch(() => undefined);
+      }
+    }
+
+    this.#maybeRetireOutgoing(transfer);
+  }
+
+  /** True when no peer is still 'offered' or 'sending' on this offer. */
+  #allPeersSettled(transfer: OutgoingTransfer): boolean {
+    for (const peer of transfer.peers.values()) {
+      if (peer.phase === 'offered' || peer.phase === 'sending') {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /** Drop a fully settled offer and tell the user how it went. */
+  #maybeRetireOutgoing(transfer: OutgoingTransfer): void {
+    if (!this.#allPeersSettled(transfer) || !this.#outgoing.has(transfer.id)) {
+      return;
+    }
+
+    this.#outgoing.delete(transfer.id);
+
+    const accepted = [...transfer.peers.values()]
+      .filter(peer => peer.phase === 'done')
+      .length;
+    const total = transfer.peers.size;
+
+    if (accepted === 0) {
+      this.#registry.appendSystem(
+        transfer.room,
+        `nobody accepted ${transfer.name}`,
+        'warn',
+        this.#now(),
+      );
+    } else {
+      this.#registry.appendSystem(
+        transfer.room,
+        `sent ${transfer.name} (${formatBytes(transfer.size)}) to ${accepted} of ${total} ${accepted === 1 ? 'peer' : 'peers'}`,
+        'info',
+        this.#now(),
+      );
+    }
+
+    this.#markDirty();
+    this.#emit();
   }
 
   #fail(error: string): ActionResult {
@@ -1272,6 +2413,8 @@ export class ZapClient {
               .map(record => this.#toPeerSnapshot(record, now)),
       messages: room === null ? [] : this.#registry.history(room),
       notice: this.#notice,
+      transfers: this.#transferSnapshots(),
+      queued: this.#queuedSnapshots(),
       status: {
         discovery: discovery.kind,
         discoveryDetail: discovery.detail,
@@ -1303,6 +2446,73 @@ export class ZapClient {
       source: record.source,
       wireVersion: record.wireVersion,
     };
+  }
+
+  /** Still-buffered messages, oldest first, for the footer/room banner. */
+  #queuedSnapshots(): QueuedMessageSnapshot[] {
+    const result: QueuedMessageSnapshot[] = [];
+    for (const envelope of this.#offlineQueue.values()) {
+      const room = envelope.room;
+      if (room === null) {
+        continue;
+      }
+
+      const message = this.#registry.history(room).find(entry => entry.id === envelope.id);
+      if (message === undefined) {
+        continue;
+      }
+
+      result.push({
+        id: message.id,
+        room,
+        text: message.text.length > 60 ? `${message.text.slice(0, 57)}…` : message.text,
+        ts: message.ts,
+      });
+    }
+
+    return result;
+  }
+
+  /** Active transfers as plain data for the UI (progress, cancel affordances). */
+  #transferSnapshots(): TransferSnapshot[] {
+    const result: TransferSnapshot[] = [];
+
+    for (const transfer of this.#outgoing.values()) {
+      let sent = 0;
+      let active = false;
+      for (const peer of transfer.peers.values()) {
+        sent = Math.max(sent, peer.sent);
+        if (peer.phase === 'sending' || peer.phase === 'offered') {
+          active = true;
+        }
+      }
+
+      if (active) {
+        result.push({
+          id: transfer.id,
+          direction: 'send',
+          name: transfer.name,
+          size: transfer.size,
+          transferred: sent,
+          state: transfer.peers.size > 0 && [...transfer.peers.values()].some(p => p.phase === 'sending')
+            ? 'sending'
+            : 'offering',
+        });
+      }
+    }
+
+    for (const transfer of this.#incoming.values()) {
+      result.push({
+        id: transfer.id,
+        direction: 'receive',
+        name: transfer.name,
+        size: transfer.size,
+        transferred: transfer.received,
+        state: 'receiving',
+      });
+    }
+
+    return result;
   }
 
   #emit(): void {

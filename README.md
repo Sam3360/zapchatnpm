@@ -62,8 +62,9 @@ zapchat            # same idea: name, rooms, /commands, no accounts
   the same encrypted transport the npm client has had since v2).
 - Same UDP discovery (multicast + broadcast), same encrypted TCP messaging,
   same rooms.
-- Command set is a friendly subset: `/rooms`, `/users`, `/me`, `/join`, `/name`,
-  `/connect`, `/status`, `/quit` (see [python/README.md](python/README.md)).
+- Command set matches the main feature set: messaging, `/me`, rooms, replies
+  and reactions, identity fingerprints and pinning (see
+  [python/README.md](python/README.md)).
 - Line-based plain-text UI — ideal for SSH sessions, tmux and old terminals.
 - Tab completion (since v7): `/jo<Tab>` completes commands, `@na<Tab>`
   completes room members, `#ge<Tab>` completes rooms — on both stacks.
@@ -157,6 +158,14 @@ other people in the room.
 | `/clear` | Clear the local view for this room |
 | `/name <username>` | Change your display name |
 | `/me <action>` | Send an action message: `/me waves` → `* sam waves` |
+| `/ids` | List recent message ids — the targets for `/reply` and `/react` |
+| `/reply <id> <text>` | Reply to a message (it is quoted visually) — a unique id prefix also works |
+| `/react <id> <emoji>` | React to a message with 👍 👎 ❤️ 😂 😮 😢 or a plain word |
+| `/file <path>` | Send a file to the room; `/file cancel [id]` aborts a transfer |
+| `/identity` | Show this install's long-term identity fingerprint |
+| `/fingerprint <name>` | Show a peer's identity key fingerprint |
+| `/trust <name>` | Pin a peer's identity key (a changed key will be refused) |
+| `/untrust <name>` | Forget a pinned identity key |
 | `/connect <host[:port]>` | Connect straight to a peer when discovery is blocked |
 | `/status` | Discovery, ports, peers and rejected frames |
 | `/quit` `/q` | Exit |
@@ -385,13 +394,14 @@ than mocks:
   directions, renaming without replaying commands as chat, and reconnecting
   after one is restarted.
 
-## Limitations (v2, stated plainly)
+## Limitations (v8, stated plainly)
 
 - **Encrypted, but not anonymous or centrally verified.** The v2 protocol
-  encrypts every TCP link and detects impostors via TOFU key pinning, but the
-  first connection to a new peer is still trust-on-first-use: a man-in-the-middle
-  present at *first* contact is not detectable. No certificate authority, no
-  QR-code verification, no safety numbers.
+  encrypts every TCP link and detects impostors via TOFU key pinning (pin a
+  peer with `/trust`), but the first connection to a new peer is still
+  trust-on-first-use: a man-in-the-middle present at *first* contact is not
+  detectable. Compare fingerprints in person with `/identity` and
+  `/fingerprint`.
 - **No history.** Chat history is in memory for the session only; quit and it is
   gone. There is no persistence to disk yet.
 - **One room at a time** per instance. You can move between rooms, but you are
@@ -401,11 +411,12 @@ than mocks:
 - **Rooms vanish when empty.** A room exists while somebody is in it or
   advertising it; the last person leaving retires it.
 - **IPv4 only.** IPv6 discovery and connections are not implemented.
-- **No file transfer, voice, threads or reactions** — and none are planned for
-  v1. The core experience is the point.
-- **No end-to-end verification of identity.** Any device on the LAN that speaks
-  the protocol can appear and pick any unused username; a client id identifies a
-  running instance, not a person.
+- **File transfer is room-wide and modest** (few MB default cap) — written to
+  your downloads/tmp folder, never executed. Voice, threads and screen sharing
+  remain out of scope.
+- **Identities are device-scoped, not person-scoped.** Any device on the LAN
+  that speaks the protocol can appear and pick any unused username; a client id
+  identifies a running instance, not a person.
 
 ## Author and creator
 

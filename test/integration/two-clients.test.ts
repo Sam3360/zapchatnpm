@@ -267,6 +267,271 @@ describe('messaging', () => {
   });
 });
 
+describe('identity commands', () => {
+  it('exposes our fingerprint and a peer\'s once a handshake completes', async () => {
+    const harness = await startClients(['alice', 'bob']);
+
+    try {
+      const [alice, bob] = harness.clients as [ZapClient, ZapClient];
+
+      // Our own fingerprint is available before any peer shows up.
+      const ours = alice.identityFingerprint();
+      assert.equal(typeof ours, 'string');
+      assert.ok(ours.length > 0, 'we always have a fingerprint');
+      assert.equal(alice.identityFingerprint(), ours, 'and it is stable');
+
+      await waitFor(() => peerConnectedTo(alice.getSnapshot(), 'bob'), {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'the pair to connect',
+      });
+
+      // Once the secure handshake completes, the peer's key is known.
+      await waitFor(() => alice.peerFingerprint('bob-does-not-exist') === null, {
+        timeoutMs: 5_000,
+        label: 'an unknown peer to report no key',
+      });
+      const bobPeer = alice
+        .getSnapshot()
+        .peers.find(peer => peer.username === 'bob');
+      assert.ok(bobPeer, 'bob is listed as a peer');
+
+      await waitFor(() => alice.peerFingerprint(bobPeer.clientId) !== null, {
+        timeoutMs: 10_000,
+        label: "bob's key to be recorded after the handshake",
+      });
+
+      const bobKey = alice.peerFingerprint(bobPeer.clientId);
+      assert.ok(bobKey, 'bob presented a key');
+      // Bob's own fingerprint is the same value from his side.
+      assert.equal(bobKey, bob.identityFingerprint());
+      // Two clients never share a fingerprint.
+      assert.notEqual(bobKey, ours);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it('trust re-pins a peer and untrust forgets the pin', async () => {
+    const harness = await startClients(['alice', 'bob']);
+
+    try {
+      const [alice] = harness.clients as [ZapClient];
+      await waitFor(
+        () => alice.getSnapshot().peers.some(peer => peer.username === 'bob' && peer.connected),
+        { timeoutMs: DISCOVERY_TIMEOUT, label: 'bob to connect' },
+      );
+
+      const bobPeer = alice.getSnapshot().peers.find(peer => peer.username === 'bob');
+      assert.ok(bobPeer);
+
+      // Untrusting a peer we have never pinned is reported, not silently ignored.
+      const unknown = alice.untrust('no-such-client');
+      assert.equal(unknown.ok, false);
+
+      // Trusting pins whatever key they currently present.
+      const trusted = alice.trust(bobPeer.clientId);
+      assert.equal(trusted.ok, true, trusted.error);
+
+      // It is idempotent: trusting again is still fine.
+      assert.equal(alice.trust(bobPeer.clientId).ok, true);
+      assert.equal(alice.untrust(bobPeer.clientId).ok, true);
+
+      // And now there is nothing left to forget.
+      const twice = alice.untrust(bobPeer.clientId);
+      assert.equal(twice.ok, false);
+      assert.match(twice.error ?? '', /no pinned key/);
+    } finally {
+      await harness.stop();
+    }
+  });
+});
+
+describe('offline queue', () => {
+  it('buffers a message sent with nobody in the room and flushes it on reconnect', async () => {
+    const harness = await startClients(['alice', 'bob']);
+
+    try {
+      const [alice, bob] = harness.clients as [ZapClient, ZapClient];
+
+      // Alice talks to an empty room: the message is rendered locally but has
+      // nowhere to go, so it is buffered rather than dropped.
+      alice.join('general');
+      const queued = alice.send('sent before anyone arrived');
+      assert.equal(queued.ok, true, queued.error);
+
+      await waitFor(() => alice.getSnapshot().queued.length === 1, {
+        timeoutMs: 10_000,
+        label: 'alice to buffer the undeliverable message',
+      });
+
+      const snapshot = alice.getSnapshot();
+      assert.equal(snapshot.queued[0]?.text, 'sent before anyone arrived');
+      assert.equal(snapshot.queued[0]?.room, 'general');
+      // The user can see it has not been delivered.
+      const localEcho = snapshot.messages.find(message => message.text === 'sent before anyone arrived');
+      assert.equal(localEcho?.queued, true, 'the local echo is marked as queued');
+
+      // Bob arrives and links up: the backlog goes out on the sweep.
+      bob.join('general');
+      await waitFor(
+        () => peerConnectedTo(alice.getSnapshot(), 'bob') && alice.getSnapshot().members.length === 1,
+        { timeoutMs: DISCOVERY_TIMEOUT, label: 'bob to join the room' },
+      );
+
+      await waitFor(() => messageTexts(bob.getSnapshot()).includes('sent before anyone arrived'), {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'the queued message to reach bob',
+      });
+
+      await waitFor(() => alice.getSnapshot().queued.length === 0, {
+        timeoutMs: 10_000,
+        label: 'alice to drain the offline queue',
+      });
+
+      const after = alice.getSnapshot();
+      const delivered = after.messages.find(
+        message => message.text === 'sent before anyone arrived',
+      );
+      assert.equal(delivered?.queued, undefined, 'the message is no longer marked queued');
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it('keeps each room backlog separate', async () => {
+    const harness = await startClients(['alice', 'bob']);
+
+    try {
+      const [alice, bob] = harness.clients as [ZapClient, ZapClient];
+      alice.join('general');
+      alice.send('for the empty general room');
+
+      // Moving to another room does not deliver the first room's backlog, and
+      // the message stays bound to the room it was written for.
+      alice.join('gaming');
+      await waitFor(() => alice.getSnapshot().room === 'gaming', { timeoutMs: 5_000 });
+
+      await waitFor(() => alice.getSnapshot().queued.length === 1, { timeoutMs: 10_000 });
+      assert.equal(alice.getSnapshot().queued[0]?.room, 'general');
+
+      // Only once somebody is in #general does that backlog flush.
+      bob.join('general');
+      await waitFor(() => messageTexts(bob.getSnapshot()).includes('for the empty general room'), {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'the general backlog to reach bob',
+      });
+    } finally {
+      await harness.stop();
+    }
+  });
+});
+
+describe('file transfer', () => {
+  it('streams an offered file to a peer and lands it in the received dir', async () => {
+    const harness = await startClients(['alice', 'bob']);
+    const payload = Buffer.alloc(64 * 1024);
+    for (let i = 0; i < payload.length; i += 1) {
+      payload[i] = (i * 31 + 7) & 0xff;
+    }
+
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zapchat-send-'));
+    tempDirs.push(sourceDir);
+    const sourcePath = path.join(sourceDir, 'payload.bin');
+    fs.writeFileSync(sourcePath, payload);
+
+    try {
+      const [alice, bob] = harness.clients as [ZapClient, ZapClient];
+      alice.join('general');
+      bob.join('general');
+
+      await waitFor(() => peerConnectedTo(alice.getSnapshot(), 'bob'), {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'the pair to connect before offering',
+      });
+      await waitFor(() => alice.getSnapshot().members.length === 1, {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'alice to see bob in the room',
+      });
+
+      const offer = alice.offerFile(sourcePath);
+      assert.equal(offer.ok, true, offer.error);
+
+      // The receiving side auto-accepts, reassembles, and announces the target.
+      await waitFor(() => {
+        const texts = bob.getSnapshot().messages.map(message => message.text);
+        return texts.some(text => text.includes('received payload.bin'));
+      }, {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'bob to receive the whole file',
+      });
+
+      const line = bob
+        .getSnapshot()
+        .messages.map(message => message.text)
+        .find(text => text.includes('received payload.bin'));
+      assert.ok(line, 'bob should have a receipt line');
+
+      // Extract the arrow path from "received payload.bin (…) from alice → <path>".
+      const target = line.split('→').pop()?.trim();
+      assert.ok(target, `no path in receipt line: ${line}`);
+      assert.ok(fs.existsSync(target), `received file missing at ${target}`);
+
+      const written = fs.readFileSync(target);
+      assert.equal(written.length, payload.length, 'received file must match byte count');
+      assert.equal(Buffer.compare(written, payload), 0, 'received bytes must be identical');
+
+      // The sender retires the offer with a success summary.
+      await waitFor(() => {
+        const texts = alice.getSnapshot().messages.map(message => message.text);
+        return texts.some(text => text.includes('sent payload.bin'));
+      }, {
+        timeoutMs: DISCOVERY_TIMEOUT,
+        label: 'alice to record the completed send',
+      });
+
+      // No transfer should remain in either snapshot once both sides settle.
+      await waitFor(
+        () =>
+          alice.getSnapshot().transfers.length === 0 &&
+          bob.getSnapshot().transfers.length === 0,
+        { timeoutMs: DISCOVERY_TIMEOUT, label: 'both sides to retire the transfer' },
+      );
+    } finally {
+      await harness.stop();
+      try {
+        const received = path.join(os.tmpdir(), 'zapchat-received');
+        if (fs.existsSync(received)) {
+          for (const entry of fs.readdirSync(received)) {
+            if (entry.includes('payload.bin')) {
+              fs.rmSync(path.join(received, entry), { force: true });
+            }
+          }
+        }
+      } catch {
+        // temp cleanup is best-effort
+      }
+    }
+  });
+
+  it('rejects offers that are not files and keeps the room usable', async () => {
+    const harness = await startClients(['alice', 'bob']);
+
+    try {
+      const [alice] = harness.clients as [ZapClient, ZapClient];
+      alice.join('general');
+
+      const missing = alice.offerFile(path.join(os.tmpdir(), 'zapchat-does-not-exist.bin'));
+      assert.equal(missing.ok, false);
+      assert.ok(missing.error && missing.error.length > 0);
+
+      const empty = alice.offerFile('');
+      assert.equal(empty.ok, false);
+    } finally {
+      await harness.stop();
+    }
+  });
+});
+
 describe('resilience', () => {
   it('notices a peer that disappears and picks it up again when it returns', async () => {
     const harness = await startClients(['alice', 'bob'], { staleMs: 2500 });

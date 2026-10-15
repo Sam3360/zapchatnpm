@@ -60,6 +60,8 @@ const COMMAND_WORDS = (() => {
 /** Commands whose argument is a room name. */
 const ROOM_ARG_COMMANDS = new Set(['join', 'create']);
 
+const REPLY_REACTION_ARGS_COMMAND = new Set(['reply', 'react']);
+
 const WORD_DELIMITER = ' ';
 
 /** The word the cursor sits in (or just left), and where it starts. */
@@ -107,6 +109,19 @@ export function completeInput(
     candidates = context.rooms;
     needle = word.replace(/^#/, '');
     prefixChar = word.startsWith('#') ? '#' : '';
+  } else if (command !== null && REPLY_REACTION_ARGS_COMMAND.has(command)) {
+    // First arg is a message id/unique prefix; second arg is free text.
+    // We only complete usernames on the *third+* word (the action body) so the
+    // id/room args themselves stay as typed.
+    if (text.slice(0, start).split(WORD_DELIMITER).length >= 3) {
+      candidates = context.members;
+      needle = word.replace(/^@/, '');
+      prefixChar = word.startsWith('@') ? '@' : '';
+    } else {
+      candidates = [];
+      needle = '';
+      prefixChar = '';
+    }
   } else {
     candidates = context.members;
     needle = word.replace(/^@/, '');

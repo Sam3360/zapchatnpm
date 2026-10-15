@@ -17,11 +17,18 @@ import {
   isActionMessage,
 } from './actions.js';
 import {
+  FILE_CHUNK_BYTES,
   MAX_ADDRESSES,
   MAX_CLOCK_SKEW_MS,
+  MAX_FILE_BYTES,
+  MAX_FILE_CHUNKS,
+  MAX_FILE_NAME_CHARS,
   MAX_MESSAGE_CHARS,
   MAX_PEERS,
+  MAX_REACTION_CHARS,
+  MIN_ID_PREFIX_CHARS,
   PROTOCOL_VERSION,
+  REACTION_SET,
   SUPPORTED_WIRE_VERSIONS,
 } from './constants.js';
 import {
@@ -55,6 +62,25 @@ export const MESSAGE_TYPES = [
   'PING',
   /** Liveness reply. */
   'PONG',
+  // ---- v8: everything below is additive. Older peers drop these frames at
+  // ---- parse time (unknown type ⇒ null) exactly like v1 peers do with v2
+  // ---- HELLO key exchanges: no crash, no misparse, full interop.
+  /** A chat message that visually quotes/replies to an earlier message. */
+  'REPLY',
+  /** An emoji reaction attached to an earlier message. */
+  'REACTION',
+  /** Offer to send a file: metadata only, no payload (receiver must accept). */
+  'FILE_OFFER',
+  /** The receiver agrees to accept an offered file. */
+  'FILE_ACCEPT',
+  /** The receiver declines an offered file. */
+  'FILE_REJECT',
+  /** One base64 chunk of an accepted file. */
+  'FILE_CHUNK',
+  /** The sender has sent the final chunk of a file. */
+  'FILE_COMPLETE',
+  /** Either side aborts an in-flight transfer. */
+  'FILE_CANCEL',
 ] as const;
 
 export type MessageType = (typeof MESSAGE_TYPES)[number];
@@ -126,6 +152,55 @@ export interface PeerListData {
 
 export interface MessageData {
   text: string;
+}
+
+// ---- v8 payload shapes (wire keys are camelCase on both stacks) ----------
+
+export interface ReplyData {
+  text: string;
+  /** Message id (or unique prefix) the reply visually quotes. */
+  replyTo: string;
+}
+
+export interface ReactionData {
+  /** Message id (or unique prefix) being reacted to. */
+  target: string;
+  /** Must be a member of REACTION_SET. */
+  reaction: string;
+}
+
+export interface FileOfferData {
+  transferId: string;
+  /** Bare file name only (no path parts survive parsing). */
+  name: string;
+  /** Exact size in bytes; receivers refuse anything over MAX_FILE_BYTES. */
+  size: number;
+  /** Optional MIME-ish hint, display only. */
+  mime?: string;
+}
+
+export interface FileAcceptData {
+  transferId: string;
+}
+
+export interface FileRejectData {
+  transferId: string;
+}
+
+export interface FileChunkData {
+  transferId: string;
+  /** Zero-based chunk index. */
+  index: number;
+  /** Base64 payload; decoded size must be ≤ FILE_CHUNK_BYTES. */
+  data: string;
+}
+
+export interface FileCompleteData {
+  transferId: string;
+}
+
+export interface FileCancelData {
+  transferId: string;
 }
 
 /** Generate a fresh, collision-resistant message id. */
@@ -373,6 +448,154 @@ export function parseMessageData(data: unknown): MessageData | null {
   return text.length === 0 ? null : { text };
 }
 
+/**
+ * A message-id reference (reply target / reaction target). Accepts a full id
+ * or a unique prefix; anything malformed is rejected so hostile peers cannot
+ * smuggle junk into the timeline metadata.
+ */
+export function parseMessageRef(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length < MIN_ID_PREFIX_CHARS || trimmed.length > 64) {
+    return null;
+  }
+
+  return /^[A-Za-z0-9_-]+$/.test(trimmed) ? trimmed : null;
+}
+
+export function parseReplyData(data: unknown): ReplyData | null {
+  if (!isPlainObject(data)) {
+    return null;
+  }
+
+  const replyTo = parseMessageRef(data['replyTo']);
+  if (replyTo === null) {
+    return null;
+  }
+
+  const raw = data['text'];
+  if (typeof raw !== 'string' || charLength(raw) > MAX_MESSAGE_CHARS * 4) {
+    return null;
+  }
+
+  const text = sanitizeMessageText(raw);
+  return text.length === 0 ? null : { text, replyTo };
+}
+
+export function parseReactionData(data: unknown): ReactionData | null {
+  if (!isPlainObject(data)) {
+    return null;
+  }
+
+  const target = parseMessageRef(data['target']);
+  const reaction = data['reaction'];
+  if (target === null || typeof reaction !== 'string') {
+    return null;
+  }
+
+  // Emoji are multi-code-point; compare against the allow-list exactly.
+  if (charLength(reaction) > MAX_REACTION_CHARS) {
+    return null;
+  }
+
+  return (REACTION_SET as readonly string[]).includes(reaction) ? { target, reaction } : null;
+}
+
+function parseTransferId(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  return value.length >= 8 && value.length <= 64 && /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
+}
+
+export function parseFileOfferData(data: unknown): FileOfferData | null {
+  if (!isPlainObject(data)) {
+    return null;
+  }
+
+  const transferId = parseTransferId(data['transferId']);
+  const size = data['size'];
+  if (transferId === null || typeof size !== 'number' || !Number.isInteger(size)) {
+    return null;
+  }
+
+  if (size <= 0 || size > MAX_FILE_BYTES) {
+    return null;
+  }
+
+  // Names are display-only and must never carry path parts (path traversal):
+  // strip every separator, keep only the final bare component.
+  const rawName = typeof data['name'] === 'string' ? data['name'] : '';
+  const bare = rawName.split(/[\\/]/).pop() ?? '';
+  const name = truncateChars(stripControlSequences(bare).trim(), MAX_FILE_NAME_CHARS);
+  if (name.length === 0 || name === '.' || name === '..') {
+    return null;
+  }
+
+  const mimeRaw = data['mime'];
+  const mime =
+    typeof mimeRaw === 'string' && mimeRaw.length > 0 && mimeRaw.length <= 64
+      ? truncateChars(stripControlSequences(mimeRaw).trim(), 64)
+      : undefined;
+
+  return {
+    transferId,
+    name,
+    size,
+    ...(mime !== undefined && mime.length > 0 ? { mime } : {}),
+  };
+}
+
+interface TransferIdPayload {
+  transferId: string;
+}
+
+function parseTransferIdData(data: unknown): TransferIdPayload | null {
+  if (!isPlainObject(data)) {
+    return null;
+  }
+
+  const transferId = parseTransferId(data['transferId']);
+  return transferId === null ? null : { transferId };
+}
+
+export function parseFileChunkData(data: unknown): FileChunkData | null {
+  if (!isPlainObject(data)) {
+    return null;
+  }
+
+  const transferId = parseTransferId(data['transferId']);
+  const index = data['index'];
+  if (transferId === null || typeof index !== 'number' || !Number.isInteger(index)) {
+    return null;
+  }
+
+  if (index < 0 || index >= MAX_FILE_CHUNKS) {
+    return null;
+  }
+
+  const encoded = data['data'];
+  if (typeof encoded !== 'string' || encoded.length === 0) {
+    return null;
+  }
+
+  // Hard cap before decoding: base64 of FILE_CHUNK_BYTES is ~5.5 KiB; anything
+  // larger can never be legal and must not reach Buffer.from (memory guard).
+  if (encoded.length > Math.ceil(FILE_CHUNK_BYTES / 3) * 4 + 8) {
+    return null;
+  }
+
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    return null;
+  }
+
+  return { transferId, index, data: encoded };
+}
+
 /** Type-guard helpers so consumers can narrow `envelope.data` safely. */
 export function readHelloData(envelope: Envelope): HelloData | null {
   return parseHelloData(envelope.data);
@@ -392,6 +615,26 @@ export function readPeerListData(envelope: Envelope): PeerListData | null {
 
 export function readMessageData(envelope: Envelope): MessageData | null {
   return parseMessageData(envelope.data);
+}
+
+export function readReplyData(envelope: Envelope): ReplyData | null {
+  return parseReplyData(envelope.data);
+}
+
+export function readReactionData(envelope: Envelope): ReactionData | null {
+  return parseReactionData(envelope.data);
+}
+
+export function readFileOfferData(envelope: Envelope): FileOfferData | null {
+  return parseFileOfferData(envelope.data);
+}
+
+export function readFileChunkData(envelope: Envelope): FileChunkData | null {
+  return parseFileChunkData(envelope.data);
+}
+
+export function readTransferIdData(envelope: Envelope): TransferIdPayload | null {
+  return parseTransferIdData(envelope.data);
 }
 
 export interface ParseEnvelopeOptions {
@@ -480,6 +723,21 @@ export function parseEnvelope(
       return readPeerListData(envelope) === null ? null : envelope;
     case 'MESSAGE':
       return readMessageData(envelope) === null ? null : envelope;
+    case 'REPLY':
+      return readReplyData(envelope) === null ? null : envelope;
+    case 'REACTION':
+      return readReactionData(envelope) === null ? null : envelope;
+    case 'FILE_OFFER':
+      return readFileOfferData(envelope) === null ? null : envelope;
+    case 'FILE_CHUNK':
+      return readFileChunkData(envelope) === null ? null : envelope;
+    case 'FILE_ACCEPT':
+    case 'FILE_REJECT':
+    case 'FILE_COMPLETE':
+    case 'FILE_CANCEL':
+      return isPlainObject(envelope.data) && parseTransferId(envelope.data['transferId']) !== null
+        ? envelope
+        : null;
     case 'JOIN':
     case 'LEAVE':
     case 'PING':

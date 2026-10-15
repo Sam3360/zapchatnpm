@@ -12,9 +12,13 @@ duplicate suppression and a one-hop relay so a message still lands when two
 peers are not directly connected to each other.
 """
 
+import base64
 import json
+import os
 import socket
 import threading
+import time
+from collections import deque
 
 from .crypto import (
     create_key_exchange,
@@ -23,19 +27,43 @@ from .crypto import (
     parse_key_exchange_from_wire,
     seal,
 )
+from .identity import identity_key_id
 from .protocol import (
+    FILE_CHUNK_BYTES,
     LEGACY_WIRE_VERSION,
+    MAX_ACTIVE_TRANSFERS,
+    MAX_FILE_BYTES,
+    MAX_MESSAGE_CHARS,
+    OFFLINE_QUEUE_LIMIT,
+    OFFLINE_QUEUE_TTL_MS,
     PROTOCOL_VERSION,
+    REACTION_SET,
     SUPPORTED_WIRE_VERSIONS,
+    TRANSFER_IDLE_TIMEOUT_MS,
     create_envelope,
     decode_frames,
     encode_action_message,
     encode_envelope,
+    new_message_id,
     now_ms,
     parse_envelope,
+    parse_file_chunk_data,
+    parse_file_offer_data,
     parse_hello_data,
     parse_message_data,
+    parse_reaction_data,
+    parse_reply_data,
+    parse_transfer_id_data,
     sanitize_room_name,
+    sanitize_text,
+)
+from .transfers import (
+    chunk_count,
+    format_bytes,
+    is_transferable_size,
+    received_file_path,
+    received_files_dir,
+    sanitize_file_name,
 )
 from .secure_framing import (
     MAGIC_BYTE,
@@ -114,6 +142,22 @@ class ChatClient:
         # so followers of a concurrent dial can report the same outcome.
         self._dial_targets = {}
 
+        # ---- v8 file transfers ------------------------------------------
+        # Offers we published: file path, room and per-peer send progress.
+        self._outgoing = {}
+        # Files peers are streaming to us, keyed by transfer id.
+        self._incoming = {}
+        # Ids whose target file is being opened (dedup + capacity guard).
+        self._pending_incoming = set()
+
+        # ---- v8 offline queue + identity --------------------------------
+        # (queued_at_ms, envelope) pairs that reached nobody, replayed once
+        # their room gains a member. Capped and TTL'd so the buffer can
+        # neither grow without bound nor surprise a peer much later.
+        self._offline = deque()
+        # client_id -> identity key id seen at handshake (for /fingerprint).
+        self._peer_key_ids = {}
+
     # ------------------------------------------------------------------ setup
 
     def start(self, port_base=45913, attempts=12):
@@ -148,7 +192,19 @@ class ChatClient:
             self._server_port = self._server.getsockname()[1]
 
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        threading.Thread(target=self._sweep_loop, daemon=True).start()
         return self._server_port
+
+    def _sweep_loop(self):
+        """Reap stalled transfers and drain the offline queue once a second
+        (same cadence as the npm sweep)."""
+        while self._running:
+            time.sleep(1.0)
+            try:
+                self.sweep_transfers()
+                self.flush_offline()
+            except Exception:  # never let the sweep die
+                pass
 
     def stop(self):
         self._running = False
@@ -165,6 +221,21 @@ class ChatClient:
                 except OSError:
                     pass
             self._links.clear()
+
+        # Abort transfers: peers on still-open links get FILE_CANCEL, and every
+        # partial download is closed and deleted so nothing half-written lives.
+        with self._lock:
+            outgoing = list(self._outgoing.values())
+            incoming = list(self._incoming.values())
+            self._outgoing.clear()
+            self._incoming.clear()
+        for transfer in outgoing:
+            transfer["cancelled"] = True
+            self._send_transfer_control(
+                "FILE_CANCEL", transfer["id"], transfer["room"], list(transfer["peers"])
+            )
+        for transfer in incoming:
+            self._discard_incoming(transfer)
 
     @property
     def port(self):
@@ -184,6 +255,48 @@ class ChatClient:
         """Usernames of every connected peer (for tab completion)."""
         with self._lock:
             return [link["username"] for link in self._links.values()]
+
+    def peer_name_map(self):
+        """client_id -> username for every live link (peer commands)."""
+        with self._lock:
+            return {client_id: link["username"] for client_id, link in self._links.items()}
+
+    def peer_rooms(self):
+        """client_id -> room each peer last announced (for /users).
+
+        A mismatch here against our own room is exactly why messages go
+        nowhere while everything looks "connected", so it must be visible.
+        """
+        with self._lock:
+            return {client_id: link["room"] for client_id, link in self._links.items()}
+
+    def identity_fingerprint(self):
+        """Fingerprint of our long-term identity key (`/identity`)."""
+        return identity_key_id(self.identity_seed)
+
+    def peer_fingerprint(self, client_id):
+        """Identity key id presented by a peer at handshake, or None."""
+        with self._lock:
+            return self._peer_key_ids.get(client_id)
+
+    def offline_count(self):
+        """Messages waiting in the offline queue (for /status)."""
+        with self._lock:
+            return len(self._offline)
+
+    def announce_identity(self):
+        """Re-send HELLO on every live link so peers see room/name changes.
+
+        Both stacks key a peer's room off its latest HELLO/JOIN frame; without
+        this, a `/join` (or `/name`) on one side silently black-holed every
+        later room-scoped message on the other — each side's broadcast filter
+        disagreed about which room the other was in.
+        """
+        hello = self._build_hello()
+        with self._lock:
+            targets = list(self._links.keys())
+        for client_id in targets:
+            self._send_to(client_id, hello)
 
     # ------------------------------------------------------------- connecting
 
@@ -410,32 +523,286 @@ class ChatClient:
     # ---------------------------------------------------------------- sending
 
     def send_chat(self, text):
-        """Send a message to every connected peer in the same room."""
+        """Send a message to every connected peer in the same room.
+
+        Nobody reachable? The message is queued (and flagged on the
+        `message-sent` event) instead of vanishing — either way the sender
+        gets a local echo, so what you type always appears on screen.
+        """
         room = self.get_room()
+        # Sanitise before the wire so peers see exactly what we echo locally
+        # (npm parity: strip ANSI/controls, cap the length).
+        clean = sanitize_text(text, MAX_MESSAGE_CHARS)
+        if clean is None:
+            self.on_event("warning", text="message is empty or too long")
+            return 0
         envelope = create_envelope(
-            "MESSAGE", self.client_id, self.username, room=room, data={"text": text}
+            "MESSAGE", self.client_id, self.username, room=room, data={"text": clean}
         )
         sent = self._broadcast(envelope, room)
-        self.on_event("message-sent", envelope=envelope, peers=sent)
+        queued = None
+        if sent == 0:
+            # Buffer it and replay when a peer in this room shows up, rather
+            # than silently dropping what the user just wrote.
+            queued = self._queue_offline(envelope)
+        self.on_event("message-sent", envelope=envelope, peers=sent, queued=queued)
         return sent
 
     def send_action(self, text):
         """Send an action (`/me waves`) to every connected peer in the room."""
         framed = encode_action_message(text)
         if framed is None:
+            self.on_event("warning", text="action is empty")
             return 0
         room = self.get_room()
         envelope = create_envelope(
             "MESSAGE", self.client_id, self.username, room=room, data={"text": framed}
         )
         sent = self._broadcast(envelope, room)
-        self.on_event("message-sent", envelope=envelope, peers=sent)
+        queued = None
+        if sent == 0:
+            queued = self._queue_offline(envelope)
+        self.on_event("message-sent", envelope=envelope, peers=sent, queued=queued)
         return sent
 
     def send_heartbeat(self):
         self._broadcast(create_envelope("PING", self.client_id, self.username), None)
 
+    def send_reply(self, reply_to, text):
+        """Reply to a message id. Returns the peer count, or None if invalid."""
+        body, target = parse_reply_data({"text": text, "replyTo": reply_to})
+        if body is None:
+            return None
+        room = self.get_room()
+        envelope = create_envelope(
+            "REPLY",
+            self.client_id,
+            self.username,
+            room=room,
+            data={"text": body, "replyTo": target},
+        )
+        sent = self._broadcast(envelope, room)
+        self.on_event(
+            "reply-sent",
+            text=body,
+            reply_to=target,
+            peers=sent,
+            room=room,
+            message_id=envelope["id"],
+        )
+        if sent == 0:
+            self.on_event("warning", text="no peers are connected yet — your reaction is only local for now")
+        return sent
+
+    def send_reaction(self, target, reaction):
+        """React to a message id. Returns the peer count, or None if invalid."""
+        goal, emoji = parse_reaction_data({"target": target, "reaction": reaction})
+        if emoji is None:
+            return None
+        room = self.get_room()
+        envelope = create_envelope(
+            "REACTION",
+            self.client_id,
+            self.username,
+            room=room,
+            data={"target": goal, "reaction": emoji},
+        )
+        sent = self._broadcast(envelope, room)
+        self.on_event(
+            "reaction-sent",
+            reaction=emoji,
+            target=goal,
+            peers=sent,
+            room=room,
+            message_id=envelope["id"],
+        )
+        if sent == 0:
+            self.on_event("warning", text="no peers are connected yet — your reaction is only local for now")
+        return sent
+
+    # ---------------------------------------------------- offline queue (v8)
+
+    def _queue_offline(self, envelope):
+        """Buffer a message that reached nobody.
+
+        Returns False when the queue was full (the oldest entry was dropped
+        so the message the user just wrote survives) — the caller tells them.
+        """
+        with self._lock:
+            had_room = len(self._offline) < OFFLINE_QUEUE_LIMIT
+            if not had_room:
+                self._offline.popleft()
+            self._offline.append((now_ms(), envelope))
+        return had_room
+
+    def _count_room(self, room):
+        with self._lock:
+            return sum(1 for link in self._links.values() if link["room"] == room)
+
+    def flush_offline(self):
+        """Replay queued messages whose room now has somebody. Returns count.
+
+        Per-envelope rather than per-room so one busy room cannot hold up (or
+        leak) another room's backlog; expired entries are pruned here too.
+        """
+        with self._lock:
+            items = list(self._offline)
+        if not items:
+            return 0
+
+        now = now_ms()
+        sent_ids = set()
+        for queued_at, envelope in items:
+            if now - queued_at > OFFLINE_QUEUE_TTL_MS:
+                continue  # expired: drop it (pruned below)
+            room = envelope["room"]
+            if not room or self._count_room(room) == 0:
+                continue  # still nobody in that room
+            if self._broadcast(envelope, room) > 0:
+                sent_ids.add(envelope["id"])
+
+        with self._lock:
+            if sent_ids:
+                self._offline = deque(
+                    (t, e) for t, e in self._offline if e["id"] not in sent_ids
+                )
+            else:
+                # Nothing delivered — still prune expired entries so TTL holds
+                # even when no peer ever shows up.
+                self._offline = deque(
+                    (t, e) for t, e in self._offline if now - t <= OFFLINE_QUEUE_TTL_MS
+                )
+
+        if sent_ids:
+            self.on_event("offline-flushed", count=len(sent_ids))
+        return len(sent_ids)
+
     # ------------------------------------------------------------- internals
+
+    def offer_file(self, file_path):
+        """Offer a local file to everyone in the current room.
+
+        Returns (True, None) on success or (False, reason) — the CLI turns the
+        reason into a one-line error, so no translation layer is needed.
+        """
+        room = self.get_room()
+        if not room:
+            return False, "join a room first (/join general)"
+
+        trimmed = (file_path or "").strip()
+        if not trimmed:
+            return False, "usage: /file <file-path>"
+
+        try:
+            stats = os.stat(trimmed)
+        except OSError:
+            return False, f"cannot read {trimmed} (no such file)"
+
+        if not os.path.isfile(trimmed):
+            return False, f"{trimmed} is not a regular file"
+
+        size = stats.st_size
+        if size == 0 or not is_transferable_size(size):
+            return False, f"file is empty or larger than {format_bytes(MAX_FILE_BYTES)}"
+
+        name = sanitize_file_name(os.path.basename(trimmed))
+        if name is None:
+            return False, "file name is not usable"
+
+        if self._slot_count() >= MAX_ACTIVE_TRANSFERS:
+            return False, f"too many active transfers (max {MAX_ACTIVE_TRANSFERS})"
+
+        with self._lock:
+            targets = [
+                cid
+                for cid, link in self._links.items()
+                if cid != self.client_id and link["room"] == room
+            ]
+        if not targets:
+            return False, "no peers are connected in this room yet — nobody can accept the offer"
+
+        now = now_ms()
+        transfer = {
+            "id": new_message_id(),
+            "room": room,
+            "path": trimmed,
+            "name": name,
+            "size": size,
+            "lastActivity": now,
+            "cancelled": False,
+            "peers": {cid: {"phase": "offered", "sent": 0} for cid in targets},
+        }
+        with self._lock:
+            self._outgoing[transfer["id"]] = transfer
+
+        envelope = create_envelope(
+            "FILE_OFFER",
+            self.client_id,
+            self.username,
+            room=room,
+            data={"transferId": transfer["id"], "name": name, "size": size},
+            ts=now,
+        )
+        sent = 0
+        for peer_id in targets:
+            if self._send_to(peer_id, envelope):
+                sent += 1
+
+        self.on_event(
+            "file-offer-out",
+            transfer_id=transfer["id"],
+            name=name,
+            size=size,
+            peers=sent,
+            chunk_count=chunk_count(size),
+        )
+        return True, None
+
+    def cancel_transfer(self, transfer_id=None):
+        """Abort transfers. With no argument every active transfer is cancelled."""
+        wanted = (transfer_id or "").strip()
+        cancelled = 0
+
+        with self._lock:
+            outgoing = list(self._outgoing.items())
+            incoming = list(self._incoming.items())
+            for tid in list(self._outgoing):
+                if not wanted or tid.startswith(wanted):
+                    del self._outgoing[tid]
+            for tid in list(self._incoming):
+                if not wanted or tid.startswith(wanted):
+                    del self._incoming[tid]
+
+        for tid, transfer in outgoing:
+            if wanted and not tid.startswith(wanted):
+                continue
+            transfer["cancelled"] = True
+            self._send_transfer_control("FILE_CANCEL", tid, transfer["room"], transfer["peers"])
+            self.on_event(
+                "file-cancelled-out", name=transfer["name"], transfer_id=tid
+            )
+            cancelled += 1
+
+        for tid, transfer in incoming:
+            if wanted and not tid.startswith(wanted):
+                continue
+            self._discard_incoming(transfer)
+            # Tell the sender to stop: a cancelled download must never count as
+            # received, and the sender must retire its offer instead of
+            # streaming chunks into the void until the whole file is pushed.
+            self._send_transfer_control(
+                "FILE_CANCEL", tid, transfer["room"], [transfer["from"]]
+            )
+            cancelled += 1
+
+        if cancelled == 0:
+            return False, f'no transfer matching "{wanted}"' if wanted else "no active transfers"
+
+        return True, None
+
+    def _slot_count(self):
+        with self._lock:
+            return len(self._outgoing) + len(self._incoming) + len(self._pending_incoming)
 
     def _build_hello(self, key_exchange=None, version=None):
         from .crypto import encode_key_exchange_for_wire
@@ -466,6 +833,7 @@ class ChatClient:
     def _pin_ok(self, client_id, identity_key_id):
         """TOFU verdict for a peer's identity key; warns on mismatch."""
         if self.check_peer_pin is None:
+            self._peer_key_ids[client_id] = identity_key_id
             return True
         verdict = self.check_peer_pin(client_id, identity_key_id)
         if verdict == "mismatch":
@@ -474,6 +842,7 @@ class ChatClient:
                 text="a peer presented a different identity key; refusing the link",
             )
             return False
+        self._peer_key_ids[client_id] = identity_key_id
         return True
 
     def _register_link(self, sock, envelope, mode, session=None, reader=None, dial_key=None):
@@ -491,7 +860,13 @@ class ChatClient:
                 "session": session,
                 "reader": reader,
                 "dial_key": dial_key,
+                # One writer at a time per socket: the heartbeat, PONG replies
+                # and transfer streaming all share this link, and interleaved
+                # sendall() calls would corrupt the frame stream.
+                "send_lock": threading.Lock(),
             }
+        # A new link may be exactly who the queued backlog was waiting for.
+        self.flush_offline()
         return True
 
     @staticmethod
@@ -727,11 +1102,22 @@ class ChatClient:
             self._send_to(client_id, create_envelope("PONG", self.client_id, self.username))
             return
         if msg_type == "HELLO":
+            room_changed = False
             with self._lock:
                 link = self._links.get(client_id)
                 if link is not None:
+                    room_changed = link["room"] != envelope["room"]
                     link["username"] = envelope["username"]
                     link["room"] = envelope["room"]
+            # A mid-session HELLO means the peer changed room/name: tell the
+            # UI (a room change with no visible trace looks like a frozen
+            # chat), then check whether our backlog was waiting for them.
+            # NB: kwarg must not be named `kind` — callbacks use that name for
+            # the event itself, and a duplicate raises inside the reader
+            # thread, killing the link's receive loop.
+            if room_changed:
+                self.on_event("presence", action="JOIN", envelope=envelope)
+            self.flush_offline()
             return
 
         if msg_type == "MESSAGE":
@@ -746,11 +1132,60 @@ class ChatClient:
                     room=envelope["room"],
                     client_id=envelope["from"],
                     ts=envelope["ts"],
+                    message_id=envelope["id"],
                 )
             # One-hop relay: forward to same-room peers that have not seen it.
             self._relay(envelope, from_client=client_id)
+        elif msg_type == "REPLY":
+            text, reply_to = parse_reply_data(envelope["data"])
+            if text:
+                self.on_event(
+                    "reply",
+                    sender=envelope["username"],
+                    text=text,
+                    reply_to=reply_to,
+                    room=envelope["room"],
+                    client_id=envelope["from"],
+                    ts=envelope["ts"],
+                    message_id=envelope["id"],
+                )
+        elif msg_type == "REACTION":
+            target, reaction = parse_reaction_data(envelope["data"])
+            if reaction:
+                self.on_event(
+                    "reaction",
+                    sender=envelope["username"],
+                    reaction=reaction,
+                    target=target,
+                    client_id=envelope["from"],
+                    room=envelope["room"],
+                    message_id=envelope["id"],
+                )
+        elif msg_type == "FILE_OFFER":
+            offer = parse_file_offer_data(envelope["data"])
+            if offer and envelope["room"] and envelope["room"] == self.get_room():
+                self._accept_offer(envelope, offer["transferId"], offer["name"], offer["size"])
+        elif msg_type == "FILE_ACCEPT":
+            self._on_file_accept(envelope)
+        elif msg_type == "FILE_REJECT":
+            self._on_file_reject(envelope)
+        elif msg_type == "FILE_CHUNK":
+            self._on_file_chunk(envelope)
+        elif msg_type == "FILE_COMPLETE":
+            self._on_file_complete(envelope)
+        elif msg_type == "FILE_CANCEL":
+            self._on_file_cancel(envelope)
         elif msg_type in ("JOIN", "LEAVE", "ANNOUNCE"):
-            self.on_event("presence", envelope=envelope)
+            with self._lock:
+                link = self._links.get(client_id)
+                if link is not None:
+                    link["username"] = envelope["username"]
+                    # A LEAVE names the room being left; everything else names
+                    # the room the peer is in now. Keeping this in sync is what
+                    # stops our room-scoped broadcasts from black-holing.
+                    link["room"] = None if msg_type == "LEAVE" else envelope["room"]
+            self.on_event("presence", action=msg_type, envelope=envelope)
+            self.flush_offline()
 
     def _remember_id(self, message_id):
         self._seen_ids.add(message_id)
@@ -806,14 +1241,173 @@ class ChatClient:
         with self._lock:
             link = self._links.get(client_id)
             sock = link["socket"] if link else None
-        if sock is None:
+            send_lock = link["send_lock"] if link else None
+        if sock is None or send_lock is None:
             return False
         try:
-            sock.sendall(wire)
+            # Held across sendall (not just the call) so two writers cannot
+            # interleave halves of a frame on the same socket.
+            with send_lock:
+                sock.sendall(wire)
             return True
         except OSError:
             self._drop_link(client_id)
             return False
+
+    def _on_file_accept(self, envelope):
+        parsed = parse_transfer_id_data(envelope["data"])
+        if parsed is None:
+            return
+        transfer_id = parsed["transferId"]
+        with self._lock:
+            transfer = self._outgoing.get(transfer_id)
+            if transfer is None or transfer["cancelled"]:
+                room = transfer["room"] if transfer else envelope["room"]
+                entry = None
+            else:
+                entry = transfer["peers"].get(envelope["from"])
+                if entry is None or entry["phase"] != "offered":
+                    return
+                entry["phase"] = "sending"
+                transfer["lastActivity"] = now_ms()
+
+        if entry is None:
+            # We are no longer offering it (cancelled/expired): tell the peer to
+            # stop waiting for chunks.
+            self._send_to(envelope["from"], create_envelope(
+                "FILE_CANCEL", self.client_id, self.username,
+                room=room, data={"transferId": transfer_id}))
+            return
+
+        threading.Thread(
+            target=self._stream_to_peer, args=(transfer, envelope["from"]), daemon=True
+        ).start()
+
+    def _on_file_reject(self, envelope):
+        parsed = parse_transfer_id_data(envelope["data"])
+        if parsed is None:
+            return
+        with self._lock:
+            transfer = self._outgoing.get(parsed["transferId"])
+            entry = transfer["peers"].get(envelope["from"]) if transfer else None
+            if transfer is not None and entry is not None and entry["phase"] == "offered":
+                entry["phase"] = "rejected"
+        if transfer is not None and entry is not None:
+            self._maybe_retire_outgoing(transfer)
+
+    def _on_file_chunk(self, envelope):
+        chunk = parse_file_chunk_data(envelope["data"])
+        if chunk is None:
+            return
+        with self._lock:
+            transfer = self._incoming.get(chunk["transferId"])
+        # Chunks only ever come from the peer whose offer we accepted, only in
+        # order, and only up to the advertised size — anything else is dropped.
+        if transfer is None or transfer["from"] != envelope["from"]:
+            return
+        if chunk["index"] != transfer["nextIndex"]:
+            return
+
+        try:
+            payload = base64.b64decode(chunk["data"], validate=True)
+        except (ValueError, TypeError):
+            return
+        if not payload or len(payload) > FILE_CHUNK_BYTES:
+            return
+
+        if transfer["received"] + len(payload) > transfer["size"]:
+            # Sender overshot its own advertised size: abort, delete the partial.
+            self._abort_incoming(
+                transfer,
+                f"{transfer['fromUsername']} sent more data than promised for "
+                f"{transfer['name']} — discarded",
+            )
+            return
+
+        transfer["nextIndex"] += 1
+        transfer["lastActivity"] = now_ms()
+        self._queue_chunk_write(transfer, payload)
+
+    def _on_file_complete(self, envelope):
+        parsed = parse_transfer_id_data(envelope["data"])
+        if parsed is None:
+            return
+        with self._lock:
+            transfer = self._incoming.pop(parsed["transferId"], None)
+        if transfer is None or transfer["from"] != envelope["from"]:
+            if transfer is not None:
+                with self._lock:
+                    self._incoming[transfer["id"]] = transfer
+            return
+
+        # Drain the queued write, then confirm the size actually matches what the
+        # sender advertised before we announce success.
+        with transfer["writeLock"]:
+            try:
+                transfer["handle"].close()
+            except (OSError, ValueError):
+                pass
+        try:
+            written = os.path.getsize(transfer["target"])
+        except OSError:
+            written = -1
+
+        if written != transfer["size"]:
+            try:
+                os.remove(transfer["target"])
+            except OSError:
+                pass
+            self.on_event(
+                "file-error",
+                transfer_id=transfer["id"],
+                text=(
+                    f"received {transfer['name']} from {transfer['fromUsername']} was "
+                    f"incomplete ({written} of {transfer['size']} bytes) — discarded"
+                ),
+            )
+            return
+
+        self.on_event(
+            "file-received",
+            transfer_id=transfer["id"],
+            name=transfer["name"],
+            size=transfer["size"],
+            sender=transfer["fromUsername"],
+            target=transfer["target"],
+        )
+
+    def _on_file_cancel(self, envelope):
+        parsed = parse_transfer_id_data(envelope["data"])
+        if parsed is None:
+            return
+        transfer_id = parsed["transferId"]
+
+        with self._lock:
+            outgoing = self._outgoing.get(transfer_id)
+            if outgoing is not None:
+                entry = outgoing["peers"].get(envelope["from"])
+                if entry is not None and entry["phase"] == "sending":
+                    entry["phase"] = "cancelled"
+                    outgoing["cancelled"] = self._all_peers_settled(outgoing)
+                else:
+                    outgoing = None
+            else:
+                incoming = self._incoming.get(transfer_id)
+                if incoming is not None and incoming["from"] == envelope["from"]:
+                    self._incoming.pop(transfer_id, None)
+                else:
+                    incoming = None
+
+        if outgoing is not None:
+            self._maybe_retire_outgoing(outgoing)
+            return
+        if incoming is not None:
+            self._discard_incoming(incoming)
+            self.on_event(
+                "file-error",
+                transfer_id=transfer_id,
+                text=f"{incoming['fromUsername']} cancelled the transfer of {incoming['name']}",
+            )
 
     def _drop_link(self, client_id):
         with self._lock:
@@ -821,3 +1415,307 @@ class ChatClient:
         if link is not None:
             self._quiet_close(link["socket"])
             self.on_event("peer-gone", client_id=client_id, username=link["username"])
+        self._abort_transfers_for(client_id)
+
+    # ------------------------------------------------------------- transfers
+
+    def _send_transfer_control(self, msg_type, transfer_id, room, peer_ids):
+        """Broadcast one FILE_ACCEPT/REJECT/COMPLETE/CANCEL control frame."""
+        envelope = create_envelope(
+            msg_type,
+            self.client_id,
+            self.username,
+            room=room,
+            data={"transferId": transfer_id},
+        )
+        for peer_id in peer_ids:
+            self._send_to(peer_id, envelope)
+
+    def _accept_offer(self, envelope, transfer_id, name, size):
+        """A peer offered us a file: open it and accept, or reject with a reason."""
+        room = envelope["room"]
+        with self._lock:
+            duplicate = transfer_id in self._incoming or transfer_id in self._pending_incoming
+            busy = len(self._outgoing) + len(self._incoming) + len(self._pending_incoming)
+        if duplicate or busy >= MAX_ACTIVE_TRANSFERS:
+            self._send_to(envelope["from"], create_envelope(
+                "FILE_REJECT", self.client_id, self.username,
+                room=room, data={"transferId": transfer_id}))
+            return
+
+        with self._lock:
+            self._pending_incoming.add(transfer_id)
+        try:
+            directory = received_files_dir()
+            os.makedirs(directory, exist_ok=True)
+            target = received_file_path(directory, transfer_id, name)
+            if target is None:
+                self._send_to(envelope["from"], create_envelope(
+                    "FILE_REJECT", self.client_id, self.username,
+                    room=room, data={"transferId": transfer_id}))
+                return
+
+            # "wb" creates-or-truncates; the unique "<transferId>-" prefix means
+            # we never clobber an earlier download of the same name.
+            handle = open(target, "wb")
+            transfer = {
+                "id": transfer_id,
+                "from": envelope["from"],
+                "fromUsername": envelope["username"],
+                "room": room,
+                "name": name,
+                "size": size,
+                "target": target,
+                "received": 0,
+                "nextIndex": 0,
+                "lastActivity": now_ms(),
+                "handle": handle,
+                # Serialises disk writes so chunks land on disk in wire order.
+                "writeLock": threading.Lock(),
+            }
+            with self._lock:
+                self._incoming[transfer_id] = transfer
+
+            self._send_to(envelope["from"], create_envelope(
+                "FILE_ACCEPT", self.client_id, self.username,
+                room=room, data={"transferId": transfer_id}))
+            self.on_event(
+                "file-receiving",
+                transfer_id=transfer_id,
+                name=name,
+                size=size,
+                sender=envelope["username"],
+                target=target,
+            )
+        except OSError:
+            self._send_to(envelope["from"], create_envelope(
+                "FILE_REJECT", self.client_id, self.username,
+                room=room, data={"transferId": transfer_id}))
+        finally:
+            with self._lock:
+                self._pending_incoming.discard(transfer_id)
+
+    def _queue_chunk_write(self, transfer, payload):
+        """Append one decoded chunk; writes are serialised so order is kept."""
+        failure = None
+        with transfer["writeLock"]:
+            # A cancel or a peer disconnect can retire the transfer while this
+            # chunk waits for the lock; never write to a closed handle.
+            with self._lock:
+                if self._incoming.get(transfer["id"]) is not transfer:
+                    return
+
+            try:
+                transfer["handle"].write(payload)
+            except (OSError, ValueError) as error:
+                failure = error
+
+        if failure is not None:
+            # Abort outside the write lock: _discard_incoming takes it too.
+            self._abort_incoming(
+                transfer, f"could not write {transfer['name']} to disk ({failure})"
+            )
+            return
+
+        transfer["received"] += len(payload)
+        self.on_event(
+            "file-progress",
+            transfer_id=transfer["id"],
+            name=transfer["name"],
+            received=transfer["received"],
+            size=transfer["size"],
+        )
+
+    def _discard_incoming(self, transfer):
+        """Close and delete a partial download. Tolerant: never raises."""
+        with transfer["writeLock"]:
+            try:
+                transfer["handle"].close()
+            except (OSError, ValueError):
+                pass
+        try:
+            os.remove(transfer["target"])
+        except OSError:
+            pass
+
+    def _abort_incoming(self, transfer, reason):
+        """Drop an in-flight download and tell the sender to stop."""
+        with self._lock:
+            if self._incoming.pop(transfer["id"], None) is None:
+                return
+        self._discard_incoming(transfer)
+        self._send_transfer_control(
+            "FILE_CANCEL", transfer["id"], transfer["room"], [transfer["from"]]
+        )
+        self.on_event("file-error", transfer_id=transfer["id"], text=reason)
+
+    def _stream_to_peer(self, transfer, peer_id):
+        """Stream one offered file to one accepting peer, chunk by chunk.
+
+        Runs on its own thread. `socket.sendall` applies real backpressure, so
+        there is nothing to pace here (the npm client has to poll its write
+        buffer instead). Any of — local cancel, shutdown, peer disconnect,
+        write refusal — stops the stream cleanly.
+        """
+        with self._lock:
+            entry = transfer["peers"].get(peer_id)
+        if entry is None or transfer["cancelled"]:
+            return
+
+        completed = False
+        try:
+            with open(transfer["path"], "rb") as handle:
+                index = 0
+                while True:
+                    if transfer["cancelled"] or not self._running:
+                        break
+                    with self._lock:
+                        if peer_id not in self._links:
+                            break
+
+                    payload = handle.read(FILE_CHUNK_BYTES)
+                    if not payload:
+                        completed = True
+                        break
+
+                    envelope = create_envelope(
+                        "FILE_CHUNK",
+                        self.client_id,
+                        self.username,
+                        room=transfer["room"],
+                        data={
+                            "transferId": transfer["id"],
+                            "index": index,
+                            "data": base64.b64encode(payload).decode("ascii"),
+                        },
+                    )
+                    if not self._send_to(peer_id, envelope):
+                        break
+
+                    index += 1
+                    entry["sent"] += len(payload)
+                    transfer["lastActivity"] = now_ms()
+                    self.on_event(
+                        "file-progress",
+                        transfer_id=transfer["id"],
+                        name=transfer["name"],
+                        received=entry["sent"],
+                        size=transfer["size"],
+                        direction="send",
+                    )
+        except OSError as error:
+            completed = False
+            self.on_event(
+                "file-error",
+                transfer_id=transfer["id"],
+                text=f"could not read {transfer['name']} ({error})",
+            )
+
+        with self._lock:
+            still_linked = peer_id in self._links
+        if completed and not transfer["cancelled"] and self._running and still_linked:
+            self._send_to(peer_id, create_envelope(
+                "FILE_COMPLETE", self.client_id, self.username,
+                room=transfer["room"], data={"transferId": transfer["id"]}))
+            entry["phase"] = "done"
+        else:
+            entry["phase"] = "cancelled"
+            if still_linked:
+                self._send_to(peer_id, create_envelope(
+                    "FILE_CANCEL", self.client_id, self.username,
+                    room=transfer["room"], data={"transferId": transfer["id"]}))
+
+        self._maybe_retire_outgoing(transfer)
+
+    @staticmethod
+    def _all_peers_settled(transfer):
+        """True when no peer is still 'offered' or 'sending' on this offer."""
+        return all(
+            peer["phase"] not in ("offered", "sending")
+            for peer in transfer["peers"].values()
+        )
+
+    def _maybe_retire_outgoing(self, transfer):
+        """Drop a fully settled offer and report how it went."""
+        with self._lock:
+            if transfer["id"] not in self._outgoing:
+                return
+            if not self._all_peers_settled(transfer):
+                return
+            self._outgoing.pop(transfer["id"], None)
+            peers = dict(transfer["peers"])
+
+        accepted = sum(1 for peer in peers.values() if peer["phase"] == "done")
+        self.on_event(
+            "file-sent",
+            transfer_id=transfer["id"],
+            name=transfer["name"],
+            size=transfer["size"],
+            accepted=accepted,
+            total=len(peers),
+        )
+
+    def _abort_transfers_for(self, client_id):
+        """A peer vanished: stop sends to it and delete its partial downloads."""
+        with self._lock:
+            outgoing = list(self._outgoing.values())
+            incoming = [
+                transfer
+                for transfer in self._incoming.values()
+                if transfer["from"] == client_id
+            ]
+
+        for transfer in outgoing:
+            entry = transfer["peers"].get(client_id)
+            if entry is None:
+                continue
+            if entry["phase"] in ("sending", "offered"):
+                entry["phase"] = "cancelled"
+            if self._all_peers_settled(transfer):
+                self._maybe_retire_outgoing(transfer)
+
+        for transfer in incoming:
+            self._abort_incoming(
+                transfer, f"{transfer['fromUsername']} disconnected — transfer aborted"
+            )
+
+    def sweep_transfers(self, now=None):
+        """Reap transfers nobody is feeding: partials deleted, offers cancelled."""
+        now = now if now is not None else now_ms()
+        with self._lock:
+            stale_in = [
+                (tid, transfer)
+                for tid, transfer in self._incoming.items()
+                if now - transfer["lastActivity"] > TRANSFER_IDLE_TIMEOUT_MS
+            ]
+            for tid, _ in stale_in:
+                del self._incoming[tid]
+            stale_out = [
+                (tid, transfer)
+                for tid, transfer in self._outgoing.items()
+                if now - transfer["lastActivity"] > TRANSFER_IDLE_TIMEOUT_MS
+            ]
+            for tid, _ in stale_out:
+                del self._outgoing[tid]
+
+        for tid, transfer in stale_in:
+            self._discard_incoming(transfer)
+            self._send_transfer_control(
+                "FILE_CANCEL", tid, transfer["room"], [transfer["from"]]
+            )
+            self.on_event(
+                "file-error",
+                transfer_id=tid,
+                text=f"transfer of {transfer['name']} timed out — partial file deleted",
+            )
+
+        for tid, transfer in stale_out:
+            transfer["cancelled"] = True
+            self._send_transfer_control(
+                "FILE_CANCEL", tid, transfer["room"], list(transfer["peers"])
+            )
+            self.on_event(
+                "file-error",
+                transfer_id=tid,
+                text=f"offer of {transfer['name']} expired (no peer response)",
+            )
