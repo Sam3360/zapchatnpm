@@ -335,6 +335,10 @@ Useful scripts:
 | `npm run test:integration` | Real UDP/TCP tests, including two spawned CLI processes |
 | `npm run typecheck` | Type-check `src/` and `test/` without emitting |
 
+Debugging a link problem: set `ZAPCHAT_DEBUG_LOG=1` to make the client print
+every internal log line (connection close reasons, discovery state) to stderr —
+otherwise headless mode hides them.
+
 ### Project layout
 
 ```

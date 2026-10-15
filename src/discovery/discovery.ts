@@ -138,7 +138,10 @@ export class DiscoveryService {
   }
 
   get port(): number {
-    return this.#port;
+    // The bound port, which differs from the configured one after the
+    // ephemeral-port fallback: beacons must advertise where we actually
+    // listen, or peers can never unicast back to us.
+    return this.#state.listening ? this.#state.port : this.#port;
   }
 
   /**
@@ -260,6 +263,8 @@ export class DiscoveryService {
         kind: bind.bindWarning !== null || warnings.length > 0 ? 'degraded' : 'ok',
         listening: true,
         multicast,
+        // Report the port actually bound (may be ephemeral after fallback).
+        port: socket.address().port,
         detail:
           bind.bindWarning !== null && warnings.length > 1
             ? warnings.join('; ')
@@ -368,6 +373,13 @@ export class DiscoveryService {
       rooms: [snapshot.room, ...snapshot.rooms].filter(
         (room): room is string => typeof room === 'string',
       ),
+      // Where a unicast beacon reaches us directly. Python clients already
+      // advertise this; without it a peer on another bind port (our own
+      // ephemeral fallback) can never send us anything — multicast and
+      // broadcast are addressed to the well-known port, so we would receive
+      // nothing at all and presence would decay to "offline" while the TCP
+      // link was healthy.
+      replyPort: socket.address().port,
     };
 
     const now = this.#now();
@@ -418,6 +430,9 @@ export class DiscoveryService {
       rooms: [snapshot.room, ...snapshot.rooms].filter(
         (room): room is string => typeof room === 'string',
       ),
+      // See #announceUnicast: advertised so peers can reach us even when we
+      // lost the well-known port and bound an ephemeral one instead.
+      replyPort: socket.address().port,
     };
 
     // One beacon per supported wire version. v1 peers (the Python client) can

@@ -66,6 +66,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     log: (message, level) => {
       if (level === 'error') {
         process.stderr.write(`${APP_NAME}: ${message}\n`);
+      } else if (process.env['ZAPCHAT_DEBUG_LOG'] === '1') {
+        // Opt-in diagnostics: connection close reasons are otherwise invisible
+        // in headless mode, which makes link drops impossible to debug.
+        process.stderr.write(`${APP_NAME}: [${level}] ${message}\n`);
       }
     },
   });

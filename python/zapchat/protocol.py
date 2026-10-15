@@ -520,9 +520,10 @@ def parse_announce_data(data):
         return None
     addresses = sanitize_address_list(data.get("addresses"))
 
-    # Optional direct-reply port (Python clients): where a unicast beacon can
-    # reach us reliably, immune to multicast outages. The npm client ignores
-    # this extra field.
+    # Optional direct-reply port: where a unicast beacon can reach us
+    # reliably, immune to multicast outages and to the sender having lost
+    # the well-known port (ephemeral bind). Both stacks advertise it since
+    # v8.0.
     reply_port = data.get("replyPort")
     if not is_valid_port(reply_port):
         reply_port = 0

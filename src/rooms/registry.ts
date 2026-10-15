@@ -340,6 +340,16 @@ export class RoomRegistry {
   removeStale(now: number = Date.now()): PeerRecord[] {
     const removed: PeerRecord[] = [];
     for (const [clientId, peer] of this.#peers) {
+      // An active link is proof of life: presence used to be beacon-driven
+      // only, so when discovery packets stopped (fallback bind port, lossy
+      // Wi-Fi, PING/PONG consumed at the transport layer) a perfectly
+      // healthy TCP link was reported "went offline" seconds after the last
+      // message. For linked peers the transport's silence timeout is the
+      // real liveness signal: it marks connected=false when the link dies,
+      // and only then does the stale reaper get to remove the record.
+      if (peer.connected) {
+        continue;
+      }
       if (now - peer.lastSeen > this.#staleMs) {
         removed.push(peer);
         this.#peers.delete(clientId);
