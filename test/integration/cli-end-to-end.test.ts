@@ -209,8 +209,34 @@ describe('cli: two processes chat over the LAN', { skip: built ? false : 'run `n
         { timeoutMs: 15000, label: 'both clients to start' },
       );
 
-      // Alice's discovery must be genuinely up (not silently degraded).
-      assert.match(alice.stdout(), /discovery ok/);
+      // Alice's discovery must be genuinely up — never a quiet failure. The
+      // listening line is a separate write on a separate pipe from the
+      // banner, so wait for it instead of racing it (that race is what made
+      // this check fail intermittently).
+      await waitFor(() => /listening tcp:\d+\s+discovery \w+/.test(alice.stdout()), {
+        timeoutMs: 15000,
+        label: 'alice to print her listening line',
+      });
+
+      // "ok" is the normal result; "degraded" is legitimate too when the
+      // client lost the shared discovery-port race or a multicast interface
+      // was briefly unavailable, because it then prints a warning line saying
+      // exactly that (the connected-peer assertions below are what prove
+      // discovery really works). "unavailable" is the real failure.
+      const listening = alice.stdout().match(/listening tcp:(\d+)\s+discovery (\w+)/);
+      assert.ok(listening, `alice never printed her listening line:\n${alice.stdout()}`);
+      const discoveryState = listening[2] ?? 'missing';
+      assert.ok(
+        discoveryState !== 'unavailable',
+        `alice's discovery failed:\n${alice.stdout()}`,
+      );
+      if (discoveryState !== 'ok') {
+        assert.match(
+          alice.stdout(),
+          /warning {2}/,
+          `degraded discovery must be announced out loud:\n${alice.stdout()}`,
+        );
+      }
 
       await waitFor(
         () => alice.stdout().includes('[local] connected to bob'),

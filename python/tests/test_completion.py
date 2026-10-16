@@ -17,8 +17,8 @@ class TestCompletionsFor:
         assert completions_for("/st") == ["/status"]
 
     def test_rotates_command_matches_sorted(self):
-        # The Python CLI has no /clear or /create: only /connect starts with c.
-        assert completions_for("/c") == ["/connect"]
+        # /clear and /connect both start with c; no /create on this stack.
+        assert completions_for("/c") == ["/clear", "/connect"]
 
     def test_never_completes_plain_chat_into_command(self):
         assert completions_for("me too") == []
@@ -61,7 +61,8 @@ class TestCompletionsFor:
         assert COMMAND_WORDS[0] == "?"
         assert "status" in COMMAND_WORDS
         assert "join" in COMMAND_WORDS
-        assert "clear" not in COMMAND_WORDS  # npm-only command
+        # /clear exists on both stacks since v8.1, so it must complete too.
+        assert "clear" in COMMAND_WORDS
 
     def test_v8_commands_are_completable(self):
         assert completions_for("/fi") == ["/file", "/fingerprint"]  # sorted

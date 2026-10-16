@@ -12,7 +12,8 @@ case-insensitive; completed candidates keep their original case.
 """
 
 # The Python CLI's actual command set (run_command in cli.py). Deliberately
-# not identical to the npm TUI: no /clear, /create or /leave here.
+# not identical to the npm TUI: no /create or /leave here (the Python client
+# stays in one room until told otherwise).
 COMMANDS = (
     "help", "h", "?",
     "rooms",
@@ -24,6 +25,7 @@ COMMANDS = (
     "reply",
     "react",
     "ids",
+    "clear",
     "file",
     "identity",
     "fingerprint",

@@ -61,6 +61,7 @@ zapchat 6.0.0 — LAN chat, no accounts, no server
 | `/untrust <name>` | Forget a pinned key |
 | `/connect <ip[:port]>` | Connect straight to a peer when discovery is blocked |
 | `/status` | Discovery state, ports, peers |
+| `/clear` | Clear this room's screen — and its persisted history |
 | `/quit` | Exit |
 
 ## How it works
@@ -84,7 +85,11 @@ the same CTCP-style framing as the npm client, so an npm user sees
 - No accounts, no telemetry, no cloud: the only network traffic is UDP
   beacons and TCP messages on your local network.
 - Config is one small JSON file (your username, a random client id, the last
-  room, your identity key and peer key pins). Chat history stays in memory.
+  room, your identity key and peer key pins). Chat lines (never join/leave
+  notices) are also mirrored to one JSONL file per room
+  (`<config dir>/history/<room>.jsonl`, 400 max) so a restart resumes where you
+  left off. `/clear` deletes the file for that room too, and `--no-history`
+  writes nothing at all.
 - Messages on a link are end-to-end encrypted with AES-256-GCM; peers are
   authenticated by TOFU key pinning, so an impostor with a changed key is
   refused loudly. This protects LAN traffic — it is still not anonymous.

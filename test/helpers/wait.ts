@@ -45,8 +45,18 @@ export function delay(ms: number): Promise<void> {
  * A random high port for a test run. Tests may run in parallel, so two test
  * files must never share a discovery port.
  */
+const usedPorts = new Set<number>();
+
 export function uniquePort(): number {
-  return randomInt(47000, 55000);
+  // Draw without repetition for the life of the process: two tests (or a test
+  // and a not-yet-dead child) sharing a port is a real source of flakes — the
+  // loser falls back to an ephemeral port and reports degraded discovery.
+  let port = randomInt(47000, 55000);
+  while (usedPorts.has(port)) {
+    port = randomInt(47000, 55000);
+  }
+  usedPorts.add(port);
+  return port;
 }
 
 /** Collect text until the predicate matches, or time out. */

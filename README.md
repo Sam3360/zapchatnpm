@@ -36,8 +36,9 @@ that discovers other instances on your local network and passes messages
 between them. Everything happens on your LAN.
 
 It is a small, focused tool, not a replacement for Discord, Slack or WhatsApp —
-and it does not want to be. If you need message history, file sharing, voice or
-accounts, use those. `zapchat` is for "we are on the same network right now".
+and it does not want to be. If you need history that follows you between
+devices, file sharing, voice or accounts, use those. `zapchat` is for "we are
+on the same network right now".
 
 ## Requirements
 
@@ -155,7 +156,7 @@ other people in the room.
 | `/join <room>` | Join a room (creates it if nobody is in it) |
 | `/create <room>` | Create a room and join it |
 | `/leave` | Leave the current room, back to the lobby |
-| `/clear` | Clear the local view for this room |
+| `/clear` | Clear the local view for this room — and its persisted history |
 | `/name <username>` | Change your display name |
 | `/me <action>` | Send an action message: `/me waves` → `* sam waves` |
 | `/ids` | List recent message ids — the targets for `/reply` and `/react` |
@@ -301,6 +302,8 @@ zapchat [options]
       --multicast <address>    discovery multicast group (default 239.255.42.99)
       --tcp-port <port>        first TCP port to try (default 45913)
       --no-discovery           share no beacons; manual connections only
+      --no-history             do not save or restore chat history
+                               (default: on; chat lines only)
       --allow-plaintext        allow unencrypted links to legacy (v1) peers
                                such as the Python client; off by default
       --inline                 render in the normal screen buffer
@@ -401,6 +404,23 @@ than mocks:
   directions, renaming without replaying commands as chat, and reconnecting
   after one is restarted.
 
+## What's new in 8.1
+
+- **Chat history survives a restart.** Chat lines (never join/leave notices) are
+  mirrored to one JSONL file per room in your config dir and replayed next time
+  you start — same semantics on the npm and Python clients. `/clear` erases the
+  screen *and* that file; `--no-history` keeps nothing on disk. See
+  [Limitations](#limitations-v8-stated-plainly) for what history is not.
+- **Healthy links stay up.** Presence now treats a connected link as proof of
+  life instead of waiting for beacons, so a peer on a working connection is no
+  longer reported offline moments after its beacon window closes — the
+  transport's silence timeout is the real liveness signal.
+- **Beacons carry a reply port.** npm advertises the port it actually bound, so
+  a peer that loses the port race on a busy machine (e.g. a Python client on
+  Windows) is still reachable instead of silently uncontactable.
+- **`ZAPCHAT_DEBUG_LOG=1`** prints discovery state and close reasons to stderr
+  on the npm client.
+
 ## Limitations (v8, stated plainly)
 
 - **Encrypted, but not anonymous or centrally verified.** The v2 protocol
@@ -409,7 +429,7 @@ than mocks:
   trust-on-first-use: a man-in-the-middle present at *first* contact is not
   detectable. Compare fingerprints in person with `/identity` and
   `/fingerprint`.
-- **History is per-device** (v8): chat lines (never notices) persist per room
+- **History is per-device** (v8.1): chat lines (never notices) persist per room
   in `<config dir>/history/<room>.jsonl` (400 max) and replay on the next
   start of *that* device — a restarted laptop shows its conversation, but a
   second laptop cannot retroactively fetch history. `/clear` wipes the screen
