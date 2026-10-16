@@ -60,6 +60,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     room: options.headless ? (options.room ?? DEFAULT_ROOM) : (options.room ?? null),
     discovery: options.discovery,
     allowPlaintext: options.allowPlaintext,
+    history: options.history,
     ...(options.discoveryPort === undefined ? {} : { discoveryPort: options.discoveryPort }),
     ...(options.multicastAddress === undefined ? {} : { multicastAddress: options.multicastAddress }),
     ...(options.tcpPort === undefined ? {} : { tcpPortBase: options.tcpPort }),

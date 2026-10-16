@@ -19,6 +19,7 @@ import {
   DEFAULT_ROOM,
   DEFAULT_TCP_PORT_BASE,
   FILE_CHUNK_BYTES,
+  HISTORY_LIMIT,
   LEGACY_WIRE_VERSION,
   MAX_ACTIVE_TRANSFERS,
   MAX_FILE_BYTES,
@@ -65,6 +66,7 @@ import {
 } from '../protocol/sanitize.js';
 import { loadConfig, saveConfigTo, type Config, type LoadConfigOptions } from '../config/config.js';
 import { createClientId, defaultUsername } from '../config/identity.js';
+import { HistoryStore } from '../config/history.js';
 import { identityKeyId } from '../config/config.js';
 import { DiscoveryService, type DiscoveryKind, type DiscoveryState } from '../discovery/discovery.js';
 import { TcpTransport, type PeerGoneReason, type PeerHandle } from '../network/transport.js';
@@ -154,6 +156,12 @@ export interface ZapClientOptions {
   allowPlaintext?: boolean;
   configPath?: string;
   staleMs?: number;
+  /**
+   * Persist chat history across restarts (v8.1, default on): one JSONL file
+   * per room under the config directory. `false` disables both writing and
+   * restoring — the session behaves exactly like v8.0.
+   */
+  history?: boolean;
   /** Extra config lookup options (tests inject env/platform). */
   configOptions?: LoadConfigOptions;
   log?: (message: string, level: 'info' | 'warn' | 'error') => void;
@@ -253,6 +261,8 @@ export class ZapClient {
 
   #config: Config;
   #configPath: string;
+  /** Durable per-room chat history; null when --no-history (or tests) opt out. */
+  #historyStore: HistoryStore | null = null;
   #clientId: string;
   #username: string;
   #usernameConfirmed: boolean;
@@ -345,11 +355,28 @@ export class ZapClient {
       this.#addWarning(`ignored invalid username "${options.username}"`);
     }
 
+    // Durable history must be wired before the registry exists: the registry
+    // hands every timeline entry to the store as it is appended, so what is
+    // on disk can never drift from what the timeline shows.
+    this.#historyStore =
+      options.history === false
+        ? null
+        : new HistoryStore(path.dirname(this.#configPath), HISTORY_LIMIT);
+
     this.#registry = new RoomRegistry({
       selfClientId: this.#clientId,
       selfUsername: this.#username,
       ...(options.staleMs === undefined ? {} : { staleMs: options.staleMs }),
+      onAppend: message => this.#historyStore?.append(message),
     });
+
+    if (this.#historyStore !== null) {
+      for (const room of this.#historyStore.rooms()) {
+        for (const message of this.#historyStore.load(room)) {
+          this.#registry.restoreMessage(message);
+        }
+      }
+    }
 
     this.#snapshot = this.#buildSnapshot();
   }
@@ -909,6 +936,9 @@ export class ZapClient {
     const room = this.#registry.selfRoom;
     if (room !== null) {
       this.#registry.clearHistory(room);
+      // Wiping the view must wipe the disk copy too, or the next restart
+      // would resurrect lines the user explicitly deleted.
+      this.#historyStore?.clearRoom(room);
       this.#markDirty();
       this.#emit();
     }

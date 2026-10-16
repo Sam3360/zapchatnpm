@@ -82,6 +82,14 @@ export interface RoomRegistryOptions {
   dedupLimit?: number;
   dedupWindowMs?: number;
   knownRoomTtlMs?: number;
+  /**
+   * Called for every message as it enters a room timeline (v8.1 history).
+   * Injected rather than polled so persistence cannot drift from what the
+   * UI actually shows: if it is in the timeline, it was offered to the hook.
+   * Restored messages (registry.restoreMessage) bypass it — they were
+   * already persisted once.
+   */
+  onAppend?: (message: ChatMessage) => void;
 }
 
 export interface UpsertPeerResult {
@@ -104,6 +112,7 @@ export class RoomRegistry {
   readonly #dedupLimit: number;
   readonly #dedupWindowMs: number;
   readonly #knownRoomTtlMs: number;
+  readonly #onAppend: ((message: ChatMessage) => void) | undefined;
 
   #selfUsername: string;
   #selfRoom: string | null = null;
@@ -123,6 +132,7 @@ export class RoomRegistry {
     this.#dedupLimit = options.dedupLimit ?? DEDUP_CACHE_SIZE;
     this.#dedupWindowMs = options.dedupWindowMs ?? DEDUP_WINDOW_MS;
     this.#knownRoomTtlMs = options.knownRoomTtlMs ?? KNOWN_ROOM_TTL_MS;
+    this.#onAppend = options.onAppend;
   }
 
   get selfClientId(): string {
@@ -457,6 +467,7 @@ export class RoomRegistry {
     const bucket = this.#history.get(message.room);
     if (bucket === undefined) {
       this.#history.set(message.room, [message]);
+      this.#onAppend?.(message);
       return;
     }
 
@@ -464,6 +475,7 @@ export class RoomRegistry {
     if (bucket.length > this.#historyLimit) {
       bucket.splice(0, bucket.length - this.#historyLimit);
     }
+    this.#onAppend?.(message);
   }
 
   /**
@@ -530,6 +542,29 @@ export class RoomRegistry {
 
   clearHistory(room: string): void {
     this.#history.delete(room);
+  }
+
+  /**
+   * Re-load a previously persisted message into a room timeline (v8.1
+   * history restore). Same bounds as `recordMessage`, but deliberately does
+   * NOT notify `onAppend` — the store feeding this method must not record
+   * its own replayed entries again.
+   */
+  restoreMessage(message: ChatMessage): void {
+    const bucket = this.#history.get(message.room);
+    if (bucket === undefined) {
+      this.#history.set(message.room, [message]);
+      return;
+    }
+
+    if (bucket.some(existing => existing.id === message.id)) {
+      return;
+    }
+
+    bucket.push(message);
+    if (bucket.length > this.#historyLimit) {
+      bucket.splice(0, bucket.length - this.#historyLimit);
+    }
   }
 
   /** Number of rooms with stored history (used by tests and diagnostics). */

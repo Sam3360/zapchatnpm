@@ -16,6 +16,7 @@ import uuid
 
 from .client import ChatClient
 from .discovery import DiscoveryService, DISCOVERY_PORT
+from .history import HISTORY_LIMIT, HistoryStore
 from .identity import PeerPinStore, identity_key_id, new_identity_seed
 from .protocol import (
     MAX_USERNAME_LENGTH,
@@ -154,6 +155,7 @@ class ChatApp:
         allow_plaintext=False,
         pin_seed=None,
         save_pins=None,
+        history_store=None,
     ):
         self.username = username
         self.room = room
@@ -163,6 +165,10 @@ class ChatApp:
         self.tcp_port = tcp_port
 
         self.history = []  # rendered lines kept for /help-style local commands
+        # Durable chat history (v8.1): chat lines only, one file per room.
+        # None when --no-history was passed.
+        self._history = history_store
+        self._restored_keys = set()  # "<id>" keys restored from disk
         # (id, room, who, preview) for recent messages, oldest first — this is
         # how users discover the ids /reply and /react take (npm parity: ids
         # are never rendered inline).
@@ -205,15 +211,47 @@ class ChatApp:
             self._save_pins(self.pin_store.to_config())
         return verdict
 
-    def _remember(self, message_id, room, who, text):
-        """Keep a recent message so `/ids` can name targets for /reply//react."""
+    def _remember(
+        self, message_id, room, who, text, raw=False
+    ):
+        """Keep a recent message so `/ids` can name targets for /reply//react.
+
+        `raw=True` means `text` is already a rendered preview (restored
+        history): skip re-rendering, which would mangle stored action lines.
+        """
         if not message_id:
             return
-        preview = render_action(who, text) if is_action_message(text) else text
+        if raw:
+            preview = text
+        else:
+            preview = render_action(who, text) if is_action_message(text) else text
         preview = " ".join(str(preview).split())[:80]
         self._recent.append((message_id, room, who, preview))
         if len(self._recent) > 200:
             del self._recent[:-200]
+
+    def _reset_recent(self, room):
+        """Drop /ids entries for a room (`/clear`); ids of a cleared room
+        would only reply into a timeline neither side can see."""
+        self._recent = [entry for entry in self._recent if entry[1] != room]
+
+    def _persist(self, message_id, room, who, text, ts, self_sent):
+        """Store one chat line durably (v8.1). Rendered like it was shown,
+        matching npm: a `/me` action is stored as `* sam waves`."""
+        if self._history is None:
+            return
+        rendered = render_action(who, text) if is_action_message(text) else text
+        self._history.append(
+            {
+                "id": message_id or "",
+                "room": room or self.room or "",
+                "kind": "chat",
+                "text": rendered,
+                "username": who,
+                "ts": ts,
+                "self": self_sent,
+            }
+        )
 
     def _on_event(self, kind, **kwargs):
         if kind == "message":
@@ -225,6 +263,9 @@ class ChatApp:
             else:
                 self._print(f"{stamp} {kwargs['sender']}: {text}")
             self._remember(kwargs.get("message_id"), kwargs.get("room"), kwargs["sender"], text)
+            self._persist(
+                kwargs.get("message_id"), kwargs.get("room"), kwargs["sender"], text, kwargs.get("ts"), False
+            )
         elif kind == "message-sent":
             # Local echo: you always see your own line, peers or not (v7
             # printed nothing here, so a sent message seemed to vanish).
@@ -248,6 +289,14 @@ class ChatApp:
                     "so the oldest queued message was dropped"
                 )
             self._remember(envelope.get("id"), envelope.get("room"), sender, text)
+            self._persist(
+                envelope.get("id"),
+                envelope.get("room"),
+                sender,
+                text,
+                envelope.get("ts"),
+                True,
+            )
         elif kind == "presence":
             envelope = kwargs.get("envelope") or {}
             who = envelope.get("username", "a peer")
@@ -358,12 +407,50 @@ class ChatApp:
         else:
             self._print("  waiting for people on this network... (ctrl+c to quit, /help)")
 
+        self._restore_history()
+
         if self.connect_to:
             address, port_text = split_host_port(self.connect_to)
             self.chat.connect_to(address, int(port_text) if port_text else 45913)
 
         threading.Thread(target=self._dial_loop, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+
+    def _restore_history(self):
+        """Replay persisted chat lines from previous sessions (v8.1).
+
+        Python's display is not room-filtered (it shows any room's traffic
+        the moment it arrives), so the restore replays all rooms, oldest
+        first. System notices were never persisted. Restored lines feed
+        /ids too, so you can /reply to something said before the restart.
+        """
+        if self._history is None:
+            return
+        restored = []
+        for room in sorted(self._history.rooms()):
+            restored.extend(self._history.load(room))
+        if not restored:
+            return
+        restored.sort(key=lambda message: message.get("ts") or 0)
+        count = len(restored)
+        self._print(
+            f"* {count} chat {'message' if count == 1 else 'messages'} "
+            "restored from history — context from the previous session"
+        )
+        for message in restored:
+            text = message.get("text") or ""
+            self._print(f"{self._stamp(message.get('ts'))} {text}")
+            message_id = message.get("id")
+            if not message_id or message_id in self._restored_keys:
+                continue
+            self._restored_keys.add(message_id)
+            self._remember(
+                message_id,
+                message.get("room"),
+                message.get("username") or "?",
+                text,
+                raw=True,
+            )
 
     def _heartbeat_loop(self):
         """PING every peer periodically so half-open links get reaped."""
@@ -428,7 +515,7 @@ class ChatApp:
             "commands: /rooms /users /me <action> /join <room> /name <username> "
             "/connect <ip[:port]> /reply <id> <text> /react <id> <emoji> "
             "/ids /file <path> /file cancel [id] /identity /fingerprint <user> "
-            "/trust <user> /untrust <user> /status /quit"
+            "/trust <user> /untrust <user> /clear /status /quit"
             )
         elif command == "rooms":
             rooms = self.discovery.live_rooms() if self.discovery else {}
@@ -606,6 +693,18 @@ class ChatApp:
             if queued:
                 self._print(f"  queued: {queued} message{'s' if queued != 1 else ''} waiting for a peer")
             self._print(f"  identity: {self.chat.identity_fingerprint()}")
+        elif command == "clear":
+            # Wipe the screen AND the persisted copy of this room's history,
+            # or the next restart would resurrect lines the user deleted.
+            with self.lock:
+                sys.stdout.write("\x1b[2J\x1b[H")
+                sys.stdout.flush()
+            self._reset_recent(self.room)
+            if self._history is not None:
+                self._history.clear_room(self.room)
+                self._print(f"* cleared #{self.room} (history wiped too)")
+            else:
+                self._print(f"* cleared #{self.room}")
         elif command in ("quit", "q", "exit"):
             raise KeyboardInterrupt
         else:
@@ -638,6 +737,11 @@ def main(argv=None):
         action="store_true",
         help="accept and dial unencrypted legacy (v1) peer links",
     )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="do not persist or restore chat history (chat lines live only in the session)",
+    )
     parser.add_argument("-v", "--version", action="version", version=f"zapchat {__version__}")
     args = parser.parse_args(argv)
 
@@ -659,6 +763,9 @@ def main(argv=None):
         allow_plaintext=args.allow_plaintext,
         pin_seed=config["peerPins"],
         save_pins=lambda pins: save_config({**config, "peerPins": pins}, config_path_used),
+        history_store=None
+        if args.no_history
+        else HistoryStore(os.path.dirname(config_path_used), HISTORY_LIMIT),
     )
 
     app.start()

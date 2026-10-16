@@ -232,8 +232,11 @@ is the port this instance is listening on.
   There is no analytics, no crash reporting, no ads, no tracking — and no code
   path that sends chat content anywhere except direct TCP connections to peers
   on your LAN.
-- **No database.** Chat history lives in memory only, for the current session,
-  and is dropped when you quit. (v1 keeps it simple: nothing is written to disk.)
+- **No database.** Chat lines (not notices) are mirrored to one small JSONL
+  file per room under your config dir (`history/<room>.jsonl`), so your
+  conversation survives a restart. Wipe it with `/clear` (which deletes the
+  file too) or opt out entirely with `--no-history` — nothing else is written
+  to disk.
 - **Local config only.** One tiny JSON file holds your username, your client id
   and the last room you visited. Its location:
   - Windows: `%APPDATA%\zapchat\config.json`
@@ -406,8 +409,11 @@ than mocks:
   trust-on-first-use: a man-in-the-middle present at *first* contact is not
   detectable. Compare fingerprints in person with `/identity` and
   `/fingerprint`.
-- **No history.** Chat history is in memory for the session only; quit and it is
-  gone. There is no persistence to disk yet.
+- **History is per-device** (v8): chat lines (never notices) persist per room
+  in `<config dir>/history/<room>.jsonl` (400 max) and replay on the next
+  start of *that* device — a restarted laptop shows its conversation, but a
+  second laptop cannot retroactively fetch history. `/clear` wipes the screen
+  and the persisted room; `--no-history` opts out on both stacks.
 - **One room at a time** per instance. You can move between rooms, but you are
   in one at a time.
 - **Same subnet only.** Discovery uses multicast/broadcast, so it does not cross
